@@ -30,6 +30,14 @@ protocol BuddyPlannerClient: AnyObject {
     /// this to decide whether to even attach images.
     var supportsImageInput: Bool { get }
 
+    /// Called at the start of each new user turn (PTT release with a
+    /// fresh transcript). Implementations that hold cross-call state —
+    /// notably Apple Foundation Models' stateful `LanguageModelSession`
+    /// whose internal transcript accumulates unboundedly — reset that
+    /// state here so the next turn starts within budget. Default no-op
+    /// for stateless conformers.
+    func resetForNewTurn()
+
     /// Generate the next assistant turn as a streamed text response.
     /// `images` are passed only when `supportsImageInput` is true. The
     /// returned text is the full accumulated response after the stream
@@ -41,6 +49,10 @@ protocol BuddyPlannerClient: AnyObject {
         userPrompt: String,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval)
+}
+
+extension BuddyPlannerClient {
+    func resetForNewTurn() { /* default no-op for stateless conformers */ }
 }
 
 enum BuddyPlannerClientFactory {

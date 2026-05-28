@@ -48,13 +48,17 @@ final class AppleFoundationModelsPlannerClient: BuddyPlannerClient {
     private var currentSessionInstructions: String?
 
     /// Reset the session — caller-facing API for "start a new
-    /// conversation." Useful for tests; CompanionManager doesn't
-    /// currently need it because turns flow continuously, but the
-    /// hook stays here so the menu-bar panel can wire a "clear
-    /// conversation" button later.
+    /// conversation." Bound to `resetForNewTurn()` so CompanionManager
+    /// can wipe stale session-internal transcript between user turns
+    /// (otherwise FM's session grows unboundedly across agent-loop
+    /// steps and busts the 4K context window after a few iterations).
     func resetSession() {
         currentSession = nil
         currentSessionInstructions = nil
+    }
+
+    func resetForNewTurn() {
+        resetSession()
     }
 
     func generateResponseStreaming(
@@ -83,9 +87,20 @@ final class AppleFoundationModelsPlannerClient: BuddyPlannerClient {
         // streaming-TTS pipeline wants (it does its own diff). The
         // explicit `generating: String.self` is needed because Swift
         // can't infer the generic Content parameter without context.
+        //
+        // Greedy sampling + temperature 0 = fully deterministic. Without
+        // this FM was emitting hallucinated CLICK coords like (1728, N)
+        // even with the anti-hallucination rule in the prompt — random
+        // sampling was generating noise that bypassed the constraint.
+        let deterministicGenerationOptions = GenerationOptions(
+            sampling: .greedy,
+            temperature: 0,
+            maximumResponseTokens: 400
+        )
         let responseStream = session.streamResponse(
             to: userPrompt,
-            generating: String.self
+            generating: String.self,
+            options: deterministicGenerationOptions
         )
         for try await snapshot in responseStream {
             accumulatedResponseText = snapshot.content

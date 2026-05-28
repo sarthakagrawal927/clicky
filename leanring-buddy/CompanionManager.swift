@@ -688,6 +688,13 @@ final class CompanionManager: ObservableObject {
         currentResponseTask?.cancel()
         ttsClient.stopPlayback()
 
+        // Tell the planner this is a fresh user turn. Stateful conformers
+        // (Apple Foundation Models) wipe their cross-call session state
+        // here so the next turn doesn't drag in 7 prior agent-loop steps
+        // and bust the 4K context window. Stateless conformers (LocalPlanner)
+        // no-op.
+        plannerClient.resetForNewTurn()
+
         currentResponseTask = Task {
             voiceState = .processing
 
