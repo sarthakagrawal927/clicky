@@ -99,29 +99,23 @@ final class LocalVLMClient {
         let imageDataURL = "data:\(mediaType);base64,\(base64EncodedImage)"
 
         let systemInstruction = """
-        You are a UI vision model. Output STRICT JSON only. No prose, no \
-        markdown, no commentary outside the JSON object.
+        You are a UI vision model. Output STRICT JSON only — no prose, no \
+        markdown fences, no commentary outside the JSON object.
 
-        Schema (note: elements FIRST, description LAST and SHORT):
-        {
-          "elements": [
-            {
-              "label": "<short, ≤4 words>",
-              "role": "<button|text_field|static_text|link|image|menu_item|checkbox|tab|other>",
-              "bbox": [<x>, <y>, <width>, <height>],
-              "text": "<verbatim text or null>"
-            }
-          ],
-          "description": "<ONE SHORT sentence, ≤20 words, app + main view>"
-        }
+        Schema. `elements` FIRST, `description` LAST and SHORT:
+        {"elements":[{"label":"<≤4 words>","role":"<button|text_field|static_text|link|image|menu_item|checkbox|tab|other>","bbox":[<x>,<y>,<w>,<h>],"text":"<verbatim or null>"}],"description":"<≤20 words, app + main view>"}
 
-        Hard rules:
-        - Emit `elements` FIRST so the JSON is usable even if the response \
-          gets truncated.
+        HARD FORMATTING RULES — failure to follow these causes truncation:
+        - Compact JSON only. NO indentation, NO newlines inside the object. \
+          One element per line is fine; multi-line per element is NOT.
+        - No trailing commas. Strings double-quoted. `text:null` (not \
+          `text:"null"`) for non-text elements.
+        - Coordinates are screen pixels, top-left origin.
+
+        CONTENT RULES:
         - `description` is one terse sentence, not a paragraph.
-        - Coordinates in screen pixels from top-left of the screenshot.
-        - Prefer high recall on interactive elements (buttons, fields, links, \
-          tabs). Skip pure decorative chrome.
+        - Prefer high recall on interactive elements (buttons, fields, \
+          links, tabs). Skip purely decorative chrome.
         - If the user intent below names a target, list that element first.
         """
 
@@ -144,6 +138,13 @@ final class LocalVLMClient {
         // the regex-extract fallback further down to pluck JSON out of
         // unstructured responses, which is what we did before anyway
         // when the model decided to wrap its JSON in prose.
+        // max_tokens bumped 2048 → 4096. The 2B VLM pretty-printed each
+        // element across multiple lines despite the prompt asking for
+        // compact output (we just tightened the prompt above); 4096
+        // gives headroom while the model still learns to be terse.
+        // Real screens regularly need 30-50 elements; at ~30 tokens
+        // per compact JSON element + 200 for the schema scaffold, 4096
+        // comfortably fits.
         let requestBody: [String: Any] = [
             "model": modelIdentifier,
             "messages": [
@@ -151,7 +152,7 @@ final class LocalVLMClient {
                 ["role": "user", "content": userMessage]
             ],
             "temperature": 0.1,
-            "max_tokens": 2048
+            "max_tokens": 4096
         ]
 
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
