@@ -27,6 +27,25 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         stop()
     }
 
+    /// Programmatically simulate a press transition — used by alternate
+    /// entry points like the walking avatar tap so they fold into the
+    /// same start-dictation pipeline as a real keyboard press. Keeps the
+    /// internal `isShortcutCurrentlyPressed` state consistent so a
+    /// subsequent real keypress doesn't see stale state.
+    func simulateShortcutPressed() {
+        guard !isShortcutCurrentlyPressed else { return }
+        isShortcutCurrentlyPressed = true
+        shortcutTransitionPublisher.send(.pressed)
+    }
+
+    /// Programmatically simulate a release transition. Mirror of
+    /// `simulateShortcutPressed`. Idempotent.
+    func simulateShortcutReleased() {
+        guard isShortcutCurrentlyPressed else { return }
+        isShortcutCurrentlyPressed = false
+        shortcutTransitionPublisher.send(.released)
+    }
+
     func start() {
         // If the event tap is already running, don't restart it.
         // Restarting resets isShortcutCurrentlyPressed, which would kill

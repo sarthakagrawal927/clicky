@@ -9,10 +9,20 @@
 
 import AVFoundation
 import Combine
+import CryptoKit
 import Foundation
 import PostHog
 import ScreenCaptureKit
 import SwiftUI
+
+/// Per-screen VLM analysis cached by the pixel hash of the screenshot.
+/// As long as the screen hasn't changed visually, repeat questions reuse
+/// the cached element map — zero VLM cost, instant response.
+private struct CachedScreenAnalysis {
+    let pixelHash: String
+    let analysis: LocalVLMScreenAnalysis
+    let capturedAt: Date
+}
 
 enum CompanionVoiceState {
     case idle
@@ -42,47 +52,112 @@ final class CompanionManager: ObservableObject {
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
 
-    // MARK: - Onboarding Video State (shared across all screen overlays)
-
-    @Published var onboardingVideoPlayer: AVPlayer?
-    @Published var showOnboardingVideo: Bool = false
-    @Published var onboardingVideoOpacity: Double = 0.0
-    private var onboardingVideoEndObserver: NSObjectProtocol?
-    private var onboardingDemoTimeObserver: Any?
-
-    // MARK: - Onboarding Prompt Bubble
-
-    /// Text streamed character-by-character on the cursor after the onboarding video ends.
-    @Published var onboardingPromptText: String = ""
-    @Published var onboardingPromptOpacity: Double = 0.0
-    @Published var showOnboardingPrompt: Bool = false
-
-    // MARK: - Onboarding Music
-
-    private var onboardingMusicPlayer: AVAudioPlayer?
-    private var onboardingMusicFadeTimer: Timer?
-
-    let buddyDictationManager = BuddyDictationManager()
+    let buddyDictationManager = PacePushToTalkManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
-    private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+    /// Tooltip-style bubble that follows the cursor and shows what's
+    /// happening through the voice turn: "listening…", interim
+    /// transcript, the planner's streaming text. Replaces the pure-
+    /// spinner UX so users can see the pipeline is alive when something
+    /// (Whisper download, slow LM Studio cold-start, network) is taking
+    /// a while.
+    private lazy var responseOverlayManager: CompanionResponseOverlayManager = {
+        let manager = CompanionResponseOverlayManager()
+        manager.setStopButtonCallback { [weak self] in
+            self?.handleStopButtonTapped()
+        }
+        return manager
     }()
 
-    private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+    /// Sentence-by-sentence TTS dispatcher. As the planner streams its
+    /// reply, completed sentences get queued to AVSpeechSynthesizer
+    /// before the response is finished generating — cuts perceived
+    /// time-to-first-spoken-word from ~3s to ~500ms.
+    private lazy var streamingSentenceTTSPipeline: StreamingSentenceTTSPipeline = {
+        return StreamingSentenceTTSPipeline(ttsClient: ttsClient)
     }()
+
+    // The reasoning/planning model. Today this is always a
+    // LocalPlannerClient pointing at LM Studio; the protocol shape stays
+    // so an alternate local runtime (Ollama, raw llama.cpp, MLX-server)
+    // can plug in by writing a new conformer.
+    private lazy var plannerClient: any BuddyPlannerClient = {
+        return BuddyPlannerClientFactory.makeDefault()
+    }()
+
+    // Always the on-device AVSpeechSynthesizer-backed client. Protocol
+    // kept so a future local TTS runtime (Kokoro/Piper-MLX) can plug in.
+    private lazy var ttsClient: any BuddyTTSClient = {
+        return BuddyTTSClientFactory.makeDefault()
+    }()
+
+    // The action executor synthesises real mouse/keyboard events on the
+    // user's behalf. Gated behind Info.plist EnableActions — when false,
+    // every method here logs and returns without posting anything.
+    private lazy var actionExecutor: PaceActionExecutor = {
+        return PaceActionExecutor()
+    }()
+
+    /// Native macOS OCR. Runs in parallel with the VLM, both pre-warmed
+    /// at PTT-press so neither shows up in perceived latency. The VLM
+    /// identifies elements; OCR delivers verbatim text — merged by
+    /// bbox overlap. Cheap (~50-200ms), no model load.
+    private let visionOCRClient = PaceVisionOCRClient()
+
+    /// Task started at PTT press that captures the screen and runs the
+    /// VLM + OCR in parallel. By the time the user finishes speaking
+    /// (~2-5s typical), the result is usually ready. The agent loop
+    /// awaits this instead of doing the work serially after the
+    /// transcript arrives. nil when not started or when pre-warm is
+    /// disabled (e.g. "Read My Screen" toggle off).
+    private var prewarmedScreenContextTask: Task<PrewarmedScreenContext?, Never>?
+
+    /// Snapshot returned by the pre-warm task. Held briefly between
+    /// PTT press and transcript arrival; consumed once by the agent
+    /// loop's first step then cleared.
+    private struct PrewarmedScreenContext {
+        let screenCaptures: [CompanionScreenCapture]
+        let enrichedAnalysesByScreenLabel: [String: LocalVLMScreenAnalysis]
+    }
+
+    // Local vision-language model (LM Studio by default) that extracts a
+    // structured element map from screenshots. Only invoked when the
+    // `UseLocalVLMForScreenContext` Info.plist key is set to true.
+    // Always allocated so toggling the key doesn't require a restart logic
+    // change, but the LM Studio server only sees traffic when enabled.
+    private lazy var localVLMClient: LocalVLMClient = {
+        let configuredBaseURL = AppBundleConfiguration.stringValue(forKey: "LocalVLMBaseURL")
+            ?? "http://localhost:1234/v1"
+        let configuredModelIdentifier = AppBundleConfiguration.stringValue(forKey: "LocalVLMModelIdentifier")
+            ?? "qwen3-vl-8b-instruct"
+        let resolvedBaseURL = URL(string: configuredBaseURL) ?? URL(string: "http://localhost:1234/v1")!
+        return LocalVLMClient(baseURL: resolvedBaseURL, modelIdentifier: configuredModelIdentifier)
+    }()
+
+    /// User-facing toggle for "read my screen". Backed by UserDefaults so
+    /// it survives launches; first launch seeds from Info.plist
+    /// `UseLocalVLMForScreenContext`. Wired to a Switch in CompanionPanelView.
+    @Published var useLocalVLMForScreenContext: Bool = PaceUserPreferencesStore
+        .boolWithInfoPlistSeed(.useLocalVLMForScreenContext, infoPlistKey: "UseLocalVLMForScreenContext")
+
+    func setUseLocalVLMForScreenContext(_ enabled: Bool) {
+        useLocalVLMForScreenContext = enabled
+        PaceUserPreferencesStore.setBool(enabled, for: .useLocalVLMForScreenContext)
+    }
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
+
+    /// Per-screen VLM analysis cache keyed by screen label (e.g.
+    /// "primary focus", "screen 2"). Hash of the screenshot's JPEG
+    /// bytes is checked on each turn: hash match → reuse cached
+    /// analysis for free; hash mismatch → re-run VLM only on the
+    /// changed screens, in parallel with the rest. This is the
+    /// performance lever for "always-looking" — most turns hit the
+    /// cache for at least some screens.
+    private var perScreenAnalysisCache: [String: CachedScreenAnalysis] = [:]
 
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
@@ -96,6 +171,35 @@ final class CompanionManager: ObservableObject {
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    /// Safety task scheduled when the user releases PTT. Fires after 5s
+    /// and resets the overlay if no transcript arrived. Cancelled if a
+    /// transcript shows up first.
+    private var transcriptSafetyTask: Task<Void, Never>?
+
+    /// Set to true inside `submitDraftText` so the safety task can tell
+    /// whether the transcription delivered. Reset on each new press.
+    private var transcriptArrivedSinceRelease: Bool = false
+
+    /// Flipped to true when the active transcription provider has
+    /// finished any background model load. Apple Speech / cloud
+    /// providers report ready immediately; WhisperKit reports ready
+    /// after CoreML compile (~15s first run, instant once cached).
+    /// PTT presses while this is false are rejected with a "model
+    /// loading" message so they don't hang the audio engine.
+    @Published private(set) var isTranscriptionModelReady: Bool = false
+
+    /// How the current voice turn was triggered. Drives where the response
+    /// bubble pins itself: `.keyboard` anchors it next to the system
+    /// cursor (so it visually rides with the Codex arrow); `.avatar`
+    /// anchors it next to the walking character. Cleared back to
+    /// `.keyboard` when the turn ends.
+    enum DictationTrigger { case keyboard, avatar }
+    private(set) var currentDictationTrigger: DictationTrigger = .keyboard
+
+    /// Weak reference set by the app delegate after the avatar overlay
+    /// manager attaches. Lets the response overlay's `.nearPoint` anchor
+    /// callback ask for the avatar's current frame.
+    weak var avatarOverlayManager: PaceAvatarOverlayManager?
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
@@ -107,25 +211,34 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
-
-    func setSelectedModel(_ model: String) {
-        selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+    /// Read-only display name of the active planner — surfaced in the
+    /// menu-bar panel so users can see which local model is wired up.
+    /// Updates only on app restart since planner-swap requires Info.plist
+    /// edit + rebuild.
+    var activePlannerDisplayName: String {
+        plannerClient.displayName
     }
 
-    /// User preference for whether the Clicky cursor should be shown.
+    /// User preference for whether the walking avatar overlay is shown
+    /// on the bottom of the cursor screen. Defaults to ON so first-run
+    /// users see the character; toggleable from the menu-bar panel.
+    @Published var isWalkingAvatarEnabled: Bool = PaceUserPreferencesStore
+        .bool(.isWalkingAvatarEnabled, default: true)
+
+    func setWalkingAvatarEnabled(_ enabled: Bool) {
+        isWalkingAvatarEnabled = enabled
+        PaceUserPreferencesStore.setBool(enabled, for: .isWalkingAvatarEnabled)
+    }
+
+    /// User preference for whether the Pace cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
     /// Persisted to UserDefaults so the choice survives app restarts.
-    @Published var isClickyCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isClickyCursorEnabled") == nil
-        ? true
-        : UserDefaults.standard.bool(forKey: "isClickyCursorEnabled")
+    @Published var isPaceCursorEnabled: Bool = PaceUserPreferencesStore
+        .bool(.isPaceCursorEnabled, default: true)
 
-    func setClickyCursorEnabled(_ enabled: Bool) {
-        isClickyCursorEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "isClickyCursorEnabled")
+    func setPaceCursorEnabled(_ enabled: Bool) {
+        isPaceCursorEnabled = enabled
+        PaceUserPreferencesStore.setBool(enabled, for: .isPaceCursorEnabled)
         transientHideTask?.cancel()
         transientHideTask = nil
 
@@ -139,145 +252,72 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Whether the user has completed onboarding at least once. Persisted
-    /// to UserDefaults so the Start button only appears on first launch.
-    var hasCompletedOnboarding: Bool {
-        get { UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") }
-        set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
+    /// Pace skips the upstream first-run flow entirely — no welcome video,
+    /// no email gate, no demo pointing animation. The cursor overlay shows
+    /// as soon as all permissions are granted. These constants exist only
+    /// so the panel UI's existing conditional branches stay simple.
+    let hasCompletedOnboarding: Bool = true
+    let hasSubmittedEmail: Bool = true
+
+    /// Tap-to-talk entry point from the walking avatar. Folds into the
+    /// same pipeline as a keyboard PTT press by simulating the shortcut
+    /// transition. First tap → start recording. Tap again while
+    /// listening → stop and submit. Taps during processing/responding
+    /// are ignored (let the in-flight turn finish; the user can press
+    /// the hotkey to cancel if they want).
+    func handleAvatarTapped() {
+        switch voiceState {
+        case .idle:
+            // Mark the trigger BEFORE simulating press so the .pressed
+            // branch picks the avatar anchor for the response bubble.
+            currentDictationTrigger = .avatar
+            globalPushToTalkShortcutMonitor.simulateShortcutPressed()
+        case .listening:
+            // Second click stops recording. Same effect as tapping the
+            // in-bubble stop button below.
+            globalPushToTalkShortcutMonitor.simulateShortcutReleased()
+        case .processing, .responding:
+            print("👆 Avatar tap ignored — turn in flight (\(voiceState))")
+        }
     }
 
-    /// Whether the user has submitted their email during onboarding.
-    @Published var hasSubmittedEmail: Bool = UserDefaults.standard.bool(forKey: "hasSubmittedEmail")
-
-    /// Submits the user's email to FormSpark and identifies them in PostHog.
-    func submitEmail(_ email: String) {
-        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedEmail.isEmpty else { return }
-
-        hasSubmittedEmail = true
-        UserDefaults.standard.set(true, forKey: "hasSubmittedEmail")
-
-        // Identify user in PostHog
-        PostHogSDK.shared.identify(trimmedEmail, userProperties: [
-            "email": trimmedEmail
-        ])
-
-        // Submit to FormSpark
-        Task {
-            var request = URLRequest(url: URL(string: "https://submit-form.com/RWbGJxmIs")!)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try? JSONSerialization.data(withJSONObject: ["email": trimmedEmail])
-            _ = try? await URLSession.shared.data(for: request)
-        }
+    /// Called by the stop button in the response bubble. Routes through
+    /// the same release path as the keyboard / second-avatar-tap.
+    func handleStopButtonTapped() {
+        guard voiceState == .listening else { return }
+        print("⏹  Stop button tapped")
+        globalPushToTalkShortcutMonitor.simulateShortcutReleased()
     }
 
     func start() {
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 Pace start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Eagerly touch the Claude API so its TLS warmup handshake completes
-        // well before the onboarding demo fires at ~40s into the video.
-        _ = claudeAPI
+        // Eagerly touch the planner so the LM Studio cold-load (model
+        // swap, first connection) happens before the user's first
+        // push-to-talk rather than blocking on it.
+        _ = plannerClient
+        // Kick off any model load the active provider needs (WhisperKit
+        // does ~15s of CoreML compile on first run; Apple Speech is
+        // instant and fires onReady synchronously). `onReady` flips the
+        // gate so PTT presses while the model is loading get rejected
+        // with a clear message instead of hanging the audio engine.
+        buddyDictationManager.transcriptionProvider.warmUpModelInBackground { [weak self] in
+            self?.isTranscriptionModelReady = true
+            print("✅ Transcription model is ready for PTT")
+        }
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
         // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
+        if hasCompletedOnboarding && allPermissionsGranted && isPaceCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
-        }
-    }
-
-    /// Called by BlueCursorView after the buddy finishes its pointing
-    /// animation and returns to cursor-following mode.
-    /// Triggers the onboarding sequence — dismisses the panel and restarts
-    /// the overlay so the welcome animation and intro video play.
-    func triggerOnboarding() {
-        // Post notification so the panel manager can dismiss the panel
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-
-        // Mark onboarding as completed so the Start button won't appear
-        // again on future launches — the cursor will auto-show instead
-        hasCompletedOnboarding = true
-
-        ClickyAnalytics.trackOnboardingStarted()
-
-        // Play Besaid theme at 60% volume, fade out after 1m 30s
-        startOnboardingMusic()
-
-        // Show the overlay for the first time — isFirstAppearance triggers
-        // the welcome animation and onboarding video
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
-    }
-
-    /// Replays the onboarding experience from the "Watch Onboarding Again"
-    /// footer link. Same flow as triggerOnboarding but the cursor overlay
-    /// is already visible so we just restart the welcome animation and video.
-    func replayOnboarding() {
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        ClickyAnalytics.trackOnboardingReplayed()
-        startOnboardingMusic()
-        // Tear down any existing overlays and recreate with isFirstAppearance = true
-        overlayWindowManager.hasShownOverlayBefore = false
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
-    }
-
-    private func stopOnboardingMusic() {
-        onboardingMusicFadeTimer?.invalidate()
-        onboardingMusicFadeTimer = nil
-        onboardingMusicPlayer?.stop()
-        onboardingMusicPlayer = nil
-    }
-
-    private func startOnboardingMusic() {
-        stopOnboardingMusic()
-        guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
-            return
-        }
-
-        do {
-            let player = try AVAudioPlayer(contentsOf: musicURL)
-            player.volume = 0.3
-            player.play()
-            self.onboardingMusicPlayer = player
-
-            // After 1m 30s, fade the music out over 3s
-            onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
-                self?.fadeOutOnboardingMusic()
-            }
-        } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
-        }
-    }
-
-    private func fadeOutOnboardingMusic() {
-        guard let player = onboardingMusicPlayer else { return }
-
-        let fadeSteps = 30
-        let fadeDuration: Double = 3.0
-        let stepInterval = fadeDuration / Double(fadeSteps)
-        let volumeDecrement = player.volume / Float(fadeSteps)
-        var stepsRemaining = fadeSteps
-
-        onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] timer in
-            stepsRemaining -= 1
-            player.volume -= volumeDecrement
-
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.stop()
-                self?.onboardingMusicPlayer = nil
-                self?.onboardingMusicFadeTimer = nil
-            }
         }
     }
 
@@ -331,13 +371,13 @@ final class CompanionManager: ObservableObject {
 
         // Track individual permission grants as they happen
         if !previouslyHadAccessibility && hasAccessibilityPermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "accessibility")
+            PaceAnalytics.trackPermissionGranted(permission: "accessibility")
         }
         if !previouslyHadScreenRecording && hasScreenRecordingPermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "screen_recording")
+            PaceAnalytics.trackPermissionGranted(permission: "screen_recording")
         }
         if !previouslyHadMicrophone && hasMicrophonePermission {
-            ClickyAnalytics.trackPermissionGranted(permission: "microphone")
+            PaceAnalytics.trackPermissionGranted(permission: "microphone")
         }
         // Screen content permission is persisted — once the user has approved the
         // SCShareableContent picker, we don't need to re-check it.
@@ -346,7 +386,7 @@ final class CompanionManager: ObservableObject {
         }
 
         if !previouslyHadAll && allPermissionsGranted {
-            ClickyAnalytics.trackAllPermissionsGranted()
+            PaceAnalytics.trackAllPermissionsGranted()
         }
     }
 
@@ -379,10 +419,10 @@ final class CompanionManager: ObservableObject {
                     guard didCapture else { return }
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
+                    PaceAnalytics.trackPermissionGranted(permission: "screen_content")
 
                     // If onboarding was already completed, show the cursor overlay now
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isPaceCursorEnabled {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                         isOverlayVisible = true
@@ -474,54 +514,105 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
-            // Don't register push-to-talk while the onboarding video is playing
-            guard !showOnboardingVideo else { return }
 
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
 
             // If the cursor is hidden, bring it back transiently for this interaction
-            if !isClickyCursorEnabled && !isOverlayVisible {
+            if !isPaceCursorEnabled && !isOverlayVisible {
                 overlayWindowManager.hasShownOverlayBefore = true
                 overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                 isOverlayVisible = true
             }
 
             // Dismiss the menu bar panel so it doesn't cover the screen
-            NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+            NotificationCenter.default.post(name: .paceDismissPanel, object: nil)
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            elevenLabsTTSClient.stopPlayback()
+            ttsClient.stopPlayback()
+            // Clear the streaming-TTS dispatch state so the new turn
+            // starts fresh — without this, the diff tracker would think
+            // half of the previous reply had already been queued.
+            streamingSentenceTTSPipeline.resetForNewTurn()
             clearDetectedElementLocation()
-
-            // Dismiss the onboarding prompt if it's showing
-            if showOnboardingPrompt {
-                withAnimation(.easeOut(duration: 0.3)) {
-                    onboardingPromptOpacity = 0.0
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    self.showOnboardingPrompt = false
-                    self.onboardingPromptText = ""
-                }
-            }
     
 
-            ClickyAnalytics.trackPushToTalkStarted()
+            PaceAnalytics.trackPushToTalkStarted()
 
+            // Show "listening…" so the user has visible feedback that the
+            // press registered. Interim transcripts overwrite this as the
+            // STT provider emits partial results, and the planner's
+            // streaming text takes over once the response starts.
+            responseOverlayManager.showOverlayAndBeginStreaming()
+            responseOverlayManager.setListeningForAudio(true)
+            responseOverlayManager.updateStreamingText("listening…")
+
+            print("🎙️ PTT pressed — starting dictation (trigger=\(currentDictationTrigger))")
+            // Fire the screen-context pre-warm in parallel with dictation.
+            // VLM + OCR run during the user's natural speech time (~2-5s)
+            // and the result is awaited by the agent loop's first step —
+            // perceived VLM latency drops to ~0 in the common case.
+            startScreenContextPrewarmIfEnabled()
+            // Reject the press if the transcription provider's model
+            // isn't loaded yet. Apple Speech (default) is always ready
+            // on launch; only relevant when the user has switched to
+            // WhisperKit and the model is still doing its CoreML compile.
+            guard isTranscriptionModelReady else {
+                print("⚠️ Speech model still loading — rejecting PTT press")
+                responseOverlayManager.setAnchor(.belowRightOfCursor)
+                responseOverlayManager.showOverlayAndBeginStreaming()
+                responseOverlayManager.updateStreamingText("speech model still loading…")
+                responseOverlayManager.finishStreaming()
+                voiceState = .idle
+                return
+            }
+            // Set the response bubble's anchor based on what triggered
+            // this turn. Keyboard → next to the cursor (rides with the
+            // Codex arrow); avatar tap → next to the walking character.
+            switch currentDictationTrigger {
+            case .keyboard:
+                responseOverlayManager.setAnchor(.belowRightOfCursor)
+                // The avatar is just visual noise during a keyboard-
+                // triggered turn. Hide it; it comes back when we return
+                // to idle below.
+                if isWalkingAvatarEnabled {
+                    avatarOverlayManager?.hide()
+                }
+            case .avatar:
+                let weakAvatarRef = avatarOverlayManager
+                responseOverlayManager.setAnchor(.aboveCenterOf(provider: { @MainActor in
+                    weakAvatarRef?.currentAvatarAnchorPoint()
+                }))
+            }
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
                 await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
                     currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
+                    updateDraftText: { [weak self] partialTranscript in
+                        // The transcription provider may call us off-main;
+                        // hop explicitly so we never violate @MainActor on
+                        // the overlay (silent isolation errors can show up
+                        // as freezes under contention).
+                        let trimmedPartial = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedPartial.isEmpty else { return }
+                        Task { @MainActor [weak self] in
+                            self?.responseOverlayManager.updateStreamingText(trimmedPartial)
+                        }
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
-                        ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            // Mark that a transcript arrived so the release
+                            // safety timer skips its cleanup pass.
+                            self.transcriptArrivedSinceRelease = true
+                            self.lastTranscript = finalTranscript
+                            print("🗣️ Companion received transcript: \(finalTranscript)")
+                            PaceAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                            self.responseOverlayManager.updateStreamingText(finalTranscript)
+                            self.sendTranscriptToPlannerWithScreenshot(transcript: finalTranscript)
+                        }
                     }
                 )
             }
@@ -530,212 +621,671 @@ final class CompanionManager: ObservableObject {
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
             // leaves the waveform overlay stuck on screen indefinitely.
-            ClickyAnalytics.trackPushToTalkReleased()
+            print("🎙️ PTT released — stopping dictation")
+            // Stamp the moment the user committed to a query so the
+            // streaming TTS pipeline can log time-to-first-spoken-word
+            // (TTFSW), the headline latency metric for this product.
+            streamingSentenceTTSPipeline.markIntentCommitted()
+            PaceAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            // The stop button only makes sense while we're actually
+            // recording — clear it as soon as the release fires.
+            responseOverlayManager.setListeningForAudio(false)
+            // Safety net: if no transcript materialises within 5s (silent
+            // audio, WhisperKit hang, mic permission revoked), clean up so
+            // the overlay doesn't sit on "listening…" indefinitely and the
+            // state machine returns to idle. The flag is flipped to true
+            // inside `submitDraftText` above.
+            transcriptArrivedSinceRelease = false
+            transcriptSafetyTask?.cancel()
+            transcriptSafetyTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await MainActor.run {
+                    guard let self else { return }
+                    guard !self.transcriptArrivedSinceRelease else { return }
+                    print("⚠️ Transcript didn't arrive within 5s — resetting state")
+                    self.responseOverlayManager.updateStreamingText("no audio detected")
+                    self.responseOverlayManager.finishStreaming()
+                    self.voiceState = .idle
+                    // Mirror the normal turn-end cleanup: bring back the
+                    // walking avatar if the user has it on, and reset the
+                    // trigger so the next press defaults to keyboard.
+                    if self.isWalkingAvatarEnabled {
+                        self.avatarOverlayManager?.show()
+                    }
+                    self.currentDictationTrigger = .keyboard
+                }
+            }
         case .none:
             break
         }
     }
 
-    // MARK: - Companion Prompt
+    // MARK: - AI Response Pipeline (plan-act-observe loop)
 
-    private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
-
-    rules:
-    - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
-    - all lowercase, casual, warm. no emojis.
-    - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
-    - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
-    - if the user's question relates to what's on their screen, reference specific things you see.
-    - if the screenshot doesn't seem relevant to their question, just answer the question directly.
-    - you can help with anything — coding, writing, general knowledge, brainstorming.
-    - never say "simply" or "just".
-    - don't read out code verbatim. describe what the code does or what needs to change conversationally.
-    - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
-    - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
-    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
-
-    element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
-
-    don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
-
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
-
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
-
-    if pointing wouldn't help, append [POINT:none].
-
-    examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
-    - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
-    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
-    """
-
-    // MARK: - AI Response Pipeline
-
-    /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
-    /// the spinner/processing state until TTS audio begins playing.
-    /// Claude's response may include a [POINT:x,y:label] tag which triggers
-    /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    /// Multi-step agent loop: capture screens → optional local VLM →
+    /// planner → execute actions → re-screenshot → repeat. Each step is
+    /// at most one planner round-trip and one action sequence. The loop
+    /// exits when the planner emits `[DONE]`, when no action tags are
+    /// emitted (it's a pure conversational answer), or when the per-task
+    /// step budget is hit.
+    ///
+    /// The user's spoken transcript becomes the first turn's prompt;
+    /// subsequent turns get a fixed "continue the task" prompt so the
+    /// planner re-anchors on the conversation history rather than a
+    /// repeated user statement.
+    private func sendTranscriptToPlannerWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        ttsClient.stopPlayback()
 
         currentResponseTask = Task {
-            // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
+            let maxAgentStepCount = PaceTagParsers.readMaxAgentStepCount()
+            var stepIndex = 0
+            var currentTurnUserPrompt = transcript
+
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                agentStepLoop: while stepIndex < maxAgentStepCount {
+                    stepIndex += 1
+                    let isFirstStep = (stepIndex == 1)
+                    guard !Task.isCancelled else { return }
 
-                guard !Task.isCancelled else { return }
+                    // 1. Capture all connected screens
+                    let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    guard !Task.isCancelled else { return }
 
-                // Build image labels with the actual screenshot pixel dimensions
-                // so Claude's coordinate space matches the image it sees. We
-                // scale from screenshot pixels to display points ourselves.
-                let labeledImages = screenCaptures.map { capture in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
-                    return (data: capture.imageData, label: capture.label + dimensionInfo)
-                }
-
-                // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
-
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    // 2. Build image labels with the actual screenshot pixel
+                    //    dimensions so the planner's coordinate space matches
+                    //    the image it sees.
+                    let labeledImages = screenCaptures.map { capture in
+                        let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                        return (data: capture.imageData, label: capture.label + dimensionInfo)
                     }
-                )
 
-                guard !Task.isCancelled else { return }
-
-                // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                let spokenText = parseResult.spokenText
-
-                // Handle element pointing if Claude returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
-                }
-
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
-                    }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    // 3. Optionally enrich the user prompt with the local VLM's
+                    //    structured element map — cuts perception cost on the
+                    //    planner side and is essential when the planner is text-only.
+                    let userPromptForPlanner = await buildUserPromptWithLocalVLMContextIfEnabled(
+                        transcript: currentTurnUserPrompt,
+                        screenCaptures: screenCaptures
                     )
 
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
-                } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
-                }
-
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
-
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
-
-                ClickyAnalytics.trackAIResponseReceived(response: spokenText)
-
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                    // 4. Build conversation history (already includes prior steps)
+                    let historyForPlanner = conversationHistory.map { entry in
+                        (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                     }
+
+                    // 5. Run the planner. Text-only planners get an empty
+                    //    images list; the VLM element-map text inside
+                    //    userPromptForPlanner is their only view of the screen.
+                    let imagesForPlanner: [(data: Data, label: String)] =
+                        plannerClient.supportsImageInput ? labeledImages : []
+
+                    // System prompt is built per-turn from blocks so we
+                    // can omit the ~700-token agent-mode block when
+                    // EnableActions is off (the default). That's pure
+                    // prefill savings every turn.
+                    let isAgentModeEnabled = AppBundleConfiguration
+                        .stringValue(forKey: "EnableActions")?
+                        .lowercased() == "true"
+                    let (fullResponseText, _) = try await plannerClient.generateResponseStreaming(
+                        images: imagesForPlanner,
+                        systemPrompt: CompanionSystemPrompt.build(includeAgentMode: isAgentModeEnabled),
+                        conversationHistory: historyForPlanner,
+                        userPrompt: userPromptForPlanner,
+                        onTextChunk: { [weak self] accumulatedPlannerText in
+                            // 1. Mirror raw text into the bubble so the user
+                            //    sees tags, thinking blocks, everything live.
+                            //    The end-of-turn step replaces this with the
+                            //    cleaned spoken text once parsing completes.
+                            self?.responseOverlayManager.updateStreamingText(accumulatedPlannerText)
+                            // 2. Hand the chunk to the streaming TTS so any
+                            //    newly-completed sentences get spoken before
+                            //    the planner has finished generating the rest.
+                            //    This is the dominant perceived-latency win.
+                            Task { @MainActor [weak self] in
+                                await self?.streamingSentenceTTSPipeline.acceptStreamedText(accumulatedPlannerText)
+                            }
+                        }
+                    )
+                    guard !Task.isCancelled else { return }
+
+                    // 6. Parse: action tags → [DONE] flag → pointing tag.
+                    //    Each pass strips its own tag class so the final
+                    //    `spokenText` is clean enough to play via TTS.
+                    let actionParseResult = PaceActionTagParser.parseActions(from: fullResponseText)
+                    let (plannerSignaledDone, textAfterDoneStrip) =
+                        PaceTagParsers.parseAndStripDoneSignal(from: actionParseResult.spokenText)
+                    let pointingParseResultRaw = PaceTagParsers.parsePointingCoordinates(from: textAfterDoneStrip)
+
+                    // When the planner emitted action tags but no explicit
+                    // [POINT:...], use the first click coordinate as the
+                    // cursor-flight target so the buddy lands where it's
+                    // about to click.
+                    let parseResult: PointingParseResult = {
+                        if pointingParseResultRaw.coordinate != nil {
+                            return pointingParseResultRaw
+                        }
+                        if let firstClickLocation = actionParseResult.firstClickVisualisationLocation {
+                            return PointingParseResult(
+                                spokenText: pointingParseResultRaw.spokenText,
+                                coordinate: CGPoint(
+                                    x: firstClickLocation.xInScreenshotPixels,
+                                    y: firstClickLocation.yInScreenshotPixels
+                                ),
+                                elementLabel: "action target",
+                                screenNumber: firstClickLocation.screenNumber
+                            )
+                        }
+                        return pointingParseResultRaw
+                    }()
+                    let spokenText = parseResult.spokenText
+                    // Replace the raw-with-tags streaming view with the
+                    // cleaned spoken text now that tags are stripped.
+                    responseOverlayManager.updateStreamingText(
+                        spokenText.isEmpty ? "…" : spokenText
+                    )
+
+                    // 7. Move the cursor to the pointing/click target so the
+                    //    flight animation is in flight before the click fires.
+                    let hasPointCoordinate = parseResult.coordinate != nil
+                    if hasPointCoordinate {
+                        voiceState = .idle
+                    }
+
+                    let targetScreenCapture: CompanionScreenCapture? = {
+                        if let screenNumber = parseResult.screenNumber,
+                           screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                            return screenCaptures[screenNumber - 1]
+                        }
+                        return screenCaptures.first(where: { $0.isCursorScreen })
+                    }()
+
+                    if let pointCoordinate = parseResult.coordinate,
+                       let targetScreenCapture {
+                        let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
+                        let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
+                        let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
+                        let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
+                        let displayFrame = targetScreenCapture.displayFrame
+
+                        let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
+                        let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
+                        let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+                        let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+                        let appKitY = displayHeight - displayLocalY
+                        let globalLocation = CGPoint(
+                            x: displayLocalX + displayFrame.origin.x,
+                            y: appKitY + displayFrame.origin.y
+                        )
+
+                        detectedElementScreenLocation = globalLocation
+                        detectedElementDisplayFrame = displayFrame
+                        PaceAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                        print("🎯 Step \(stepIndex) pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    } else {
+                        print("🎯 Step \(stepIndex) pointing: \(parseResult.elementLabel ?? "no element")")
+                    }
+
+                    // 8. Save this step to conversation history. First step
+                    //    gets the real transcript; later steps record the
+                    //    continuation placeholder so the planner sees its
+                    //    own previous narration via assistant turns.
+                    conversationHistory.append((
+                        userTranscript: isFirstStep ? transcript : "(agent step \(stepIndex))",
+                        assistantResponse: spokenText
+                    ))
+                    // Keep history short. Every prior exchange adds prefill
+                    // work each turn — research from this branch's TTFT
+                    // logs showed planner TTFT scaling near-linearly with
+                    // total prefix tokens. 3 exchanges keeps "remember
+                    // what we just talked about" intact without ballooning.
+                    if conversationHistory.count > 3 {
+                        conversationHistory.removeFirst(conversationHistory.count - 3)
+                    }
+                    print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+                    PaceAnalytics.trackAIResponseReceived(response: spokenText)
+
+                    // 9. The bulk of the spoken response has been queued
+                    //    sentence-by-sentence inside the onTextChunk
+                    //    callback above as the planner was generating.
+                    //    Here we just speak whatever tail remains past
+                    //    the last sentence boundary the streamer found,
+                    //    using the fully-cleaned spokenText as the
+                    //    source of truth (the streamer used a coarser
+                    //    in-flight strip).
+                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: spokenText)
+                        voiceState = .responding
+                    }
+
+                    // 10. Execute action tags if any.
+                    if !actionParseResult.actions.isEmpty {
+                        if actionExecutor.actionsAreEnabled {
+                            // Brief settle so the cursor flight visibly arrives
+                            // before the synthetic click fires.
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            guard !Task.isCancelled else { return }
+                            await actionExecutor.executeActionSequence(
+                                actionParseResult.actions,
+                                screenCaptures: screenCaptures
+                            )
+                        } else {
+                            print("🤖 \(actionParseResult.actions.count) action(s) parsed but EnableActions is false — exiting loop after this step")
+                        }
+                    }
+
+                    // 11. Exit conditions for the agent loop:
+                    //     - planner emitted [DONE]
+                    //     - planner emitted no action tags (pure answer turn)
+                    //     - actions are disabled (treat every turn as single-shot)
+                    let exitLoop = plannerSignaledDone
+                        || actionParseResult.actions.isEmpty
+                        || !actionExecutor.actionsAreEnabled
+                    if exitLoop {
+                        if plannerSignaledDone {
+                            print("✅ Agent loop: planner signaled [DONE] at step \(stepIndex)")
+                        }
+                        break agentStepLoop
+                    }
+
+                    // 12. Brief wait so the action's effect lands in the UI
+                    //     before we capture the next screenshot. Without this
+                    //     the new screen capture may still show pre-click state.
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    guard !Task.isCancelled else { return }
+
+                    // Set up the next iteration.
+                    currentTurnUserPrompt = "continue the task. look at the current screen, then either emit the next step's action tags or emit [DONE] if the task is complete."
+                    voiceState = .processing
+                }
+
+                if stepIndex >= maxAgentStepCount {
+                    print("⚠️ Agent loop: hit max steps (\(maxAgentStepCount)) without [DONE] — stopping")
                 }
             } catch is CancellationError {
-                // User spoke again — response was interrupted
+                // User spoke again — response was interrupted. Hide the
+                // overlay immediately so it doesn't linger over the next
+                // turn's "listening…" state.
+                responseOverlayManager.hideOverlay()
             } catch {
-                ClickyAnalytics.trackResponseError(error: error.localizedDescription)
+                PaceAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
+                responseOverlayManager.updateStreamingText("error: \(error.localizedDescription)")
+                responseOverlayManager.finishStreaming()
                 speakCreditsErrorFallback()
             }
 
             if !Task.isCancelled {
                 voiceState = .idle
+                // Keep the bubble up while TTS is still speaking so the
+                // user can read along, then fade ~800ms after audio ends.
+                let weakTTSClient = ttsClient
+                responseOverlayManager.finishStreaming(keepVisibleUntil: { @MainActor in
+                    weakTTSClient.isPlaying
+                })
+                // Restore the walking avatar (if user has it enabled)
+                // and reset the trigger so the next turn defaults to
+                // keyboard until something says otherwise.
+                if isWalkingAvatarEnabled {
+                    avatarOverlayManager?.show()
+                }
+                currentDictationTrigger = .keyboard
                 scheduleTransientHideIfNeeded()
             }
         }
     }
 
-    /// If the cursor is in transient mode (user toggled "Show Clicky" off),
+    /// Builds the prompt sent to the cloud planner. When the local VLM is
+    /// enabled in Info.plist, runs the cursor screen through it first and
+    /// prepends a structured element map. The cloud planner can then refer
+    /// to elements by name without re-doing the perception work itself.
+    ///
+    /// If the VLM is unreachable or errors, returns the raw transcript
+    /// unchanged so the cloud-only path keeps working. Errors are logged
+    /// for debugging but never surfaced to the user.
+    private func buildUserPromptWithLocalVLMContextIfEnabled(
+        transcript: String,
+        screenCaptures: [CompanionScreenCapture]
+    ) async -> String {
+        guard useLocalVLMForScreenContext else {
+            print("👁️  VLM skipped — 'Read My Screen' toggle is off")
+            return transcript
+        }
+
+        // First try: did the PTT-press pre-warm finish? If yes, we
+        // consume its result and skip the synchronous VLM + OCR work
+        // entirely — perceived VLM latency drops to ~0.
+        if let prewarmedTask = prewarmedScreenContextTask {
+            print("👁️  Awaiting pre-warm result…")
+            let awaitStartedAt = Date()
+            let prewarmed = await prewarmedTask.value
+            prewarmedScreenContextTask = nil
+            let awaitedDuration = Date().timeIntervalSince(awaitStartedAt)
+            if let prewarmed, !prewarmed.screenCaptures.isEmpty {
+                print(String(format: "👁️  Pre-warm consumed in %.2fs", awaitedDuration))
+                return buildPromptFromEnrichedAnalyses(
+                    transcript: transcript,
+                    captures: prewarmed.screenCaptures,
+                    enrichedAnalysesByLabel: prewarmed.enrichedAnalysesByScreenLabel
+                )
+            }
+            print("⚠️ Pre-warm returned nothing — falling back to synchronous VLM")
+        }
+
+        guard !screenCaptures.isEmpty else {
+            print("⚠️ VLM skipped — no screen captures available")
+            return transcript
+        }
+
+        // Synchronous fallback: pre-warm wasn't started or failed.
+        // Cursor-screen-only by design — user is almost always asking
+        // about the screen they're looking at.
+        let orderedCaptures: [CompanionScreenCapture] = {
+            if let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) {
+                return [cursorScreenCapture]
+            }
+            if let firstCapture = screenCaptures.first {
+                return [firstCapture]
+            }
+            return []
+        }()
+
+        // Bucket captures into cache hits (free, reuse stored analysis)
+        // and misses (need a fresh VLM call). Hash is SHA256 of the JPEG
+        // bytes — stable across runs, cheap (~5ms for 1MB).
+        var perCaptureCachedAnalysis: [Int: LocalVLMScreenAnalysis] = [:]
+        var capturesToAnalyze: [(captureIndex: Int, capture: CompanionScreenCapture, pixelHash: String)] = []
+
+        for (captureIndex, capture) in orderedCaptures.enumerated() {
+            let pixelHash = Self.computePixelHash(for: capture.imageData)
+            if let cached = perScreenAnalysisCache[capture.label],
+               cached.pixelHash == pixelHash {
+                perCaptureCachedAnalysis[captureIndex] = cached.analysis
+                print("👁️  Cache HIT for \(capture.label) — reusing \(cached.analysis.elements.count) elements")
+            } else {
+                capturesToAnalyze.append((captureIndex, capture, pixelHash))
+            }
+        }
+
+        // Run VLM in parallel on every cache-missed screen.
+        var freshAnalysesByCaptureIndex: [Int: LocalVLMScreenAnalysis] = [:]
+        if !capturesToAnalyze.isEmpty {
+            print("👁️  Running VLM + OCR on \(capturesToAnalyze.count) screen(s) in parallel…")
+            let analyses = await withTaskGroup(
+                of: (Int, String, LocalVLMScreenAnalysis?, String).self
+            ) { taskGroup in
+                for (captureIndex, capture, pixelHash) in capturesToAnalyze {
+                    taskGroup.addTask { [localVLMClient, visionOCRClient] in
+                        // VLM + OCR concurrent. OCR finishes much faster
+                        // (~100-200ms); we wait on the VLM and then merge.
+                        async let vlmAnalysisFuture = localVLMClient.analyzeScreenshot(
+                            screenshotImageData: capture.imageData,
+                            userIntent: transcript
+                        )
+                        async let ocrBoxesFuture = visionOCRClient.recognizeText(
+                            in: capture.imageData,
+                            screenshotWidthInPixels: capture.screenshotWidthInPixels,
+                            screenshotHeightInPixels: capture.screenshotHeightInPixels
+                        )
+                        do {
+                            let vlmAnalysis = try await vlmAnalysisFuture
+                            let ocrBoxes = (try? await ocrBoxesFuture) ?? []
+                            let enriched = PaceScreenContextMerger.enrich(
+                                vlmAnalysis: vlmAnalysis,
+                                with: ocrBoxes
+                            )
+                            return (captureIndex, capture.label, enriched, pixelHash)
+                        } catch {
+                            print("⚠️ VLM failed for \(capture.label): \(error.localizedDescription)")
+                            return (captureIndex, capture.label, nil, pixelHash)
+                        }
+                    }
+                }
+                var collected: [(Int, String, LocalVLMScreenAnalysis?, String)] = []
+                for await result in taskGroup {
+                    collected.append(result)
+                }
+                return collected
+            }
+            for (captureIndex, label, maybeAnalysis, pixelHash) in analyses {
+                guard let analysis = maybeAnalysis else { continue }
+                freshAnalysesByCaptureIndex[captureIndex] = analysis
+                perScreenAnalysisCache[label] = CachedScreenAnalysis(
+                    pixelHash: pixelHash,
+                    analysis: analysis,
+                    capturedAt: Date()
+                )
+                print("👁️  VLM analysed \(label): \(analysis.elements.count) elements")
+            }
+        }
+
+        // Merge cached + fresh analyses back into the original capture order.
+        var perScreenPromptSections: [String] = []
+        for (captureIndex, capture) in orderedCaptures.enumerated() {
+            let analysis = perCaptureCachedAnalysis[captureIndex]
+                ?? freshAnalysesByCaptureIndex[captureIndex]
+            guard let analysis else { continue }
+            perScreenPromptSections.append(Self.formatScreenAnalysisForPrompt(
+                screenLabel: capture.label,
+                analysis: analysis
+            ))
+        }
+
+        if perScreenPromptSections.isEmpty {
+            print("⚠️ All VLM calls failed — falling back to raw transcript")
+            return transcript
+        }
+
+        let joinedScreenSections = perScreenPromptSections.joined(separator: "\n\n")
+        return """
+        On-device screen analysis (auto-extracted by a local vision model on each connected display):
+
+        \(joinedScreenSections)
+
+        User said: \(transcript)
+        """
+    }
+
+    /// Build the planner prompt from already-enriched analyses (the
+    /// pre-warm path). Same formatting as the synchronous path so the
+    /// planner can't tell whether it's reading a pre-warmed or fresh
+    /// analysis — keeps prompt-engineering work consistent.
+    private func buildPromptFromEnrichedAnalyses(
+        transcript: String,
+        captures: [CompanionScreenCapture],
+        enrichedAnalysesByLabel: [String: LocalVLMScreenAnalysis]
+    ) -> String {
+        let perScreenPromptSections: [String] = captures.compactMap { capture in
+            guard let analysis = enrichedAnalysesByLabel[capture.label] else { return nil }
+            return Self.formatScreenAnalysisForPrompt(
+                screenLabel: capture.label,
+                analysis: analysis
+            )
+        }
+        guard !perScreenPromptSections.isEmpty else { return transcript }
+        return """
+        On-device screen analysis (auto-extracted by a local vision model + native OCR):
+
+        \(perScreenPromptSections.joined(separator: "\n\n"))
+
+        User said: \(transcript)
+        """
+    }
+
+    /// Render one screen's element map into the planner-prompt block.
+    /// Compact format: one element per line as `role|x,y|label|text`.
+    /// Drops the verbose `[x= y= w= h=]` syntax and the natural-language
+    /// description — the planner needs the element list to act, the
+    /// description is mostly noise. Cap reduced to 25 elements; with
+    /// OCR enrichment the long tail is mostly low-signal anyway. These
+    /// two changes roughly halve the per-turn prefill cost.
+    private static func formatScreenAnalysisForPrompt(
+        screenLabel: String,
+        analysis: LocalVLMScreenAnalysis
+    ) -> String {
+        let maxElementsRendered = 25
+        let elementSummaryLines = analysis.elements.prefix(maxElementsRendered).map { element -> String in
+            let coordinateText = element.bbox.count == 4
+                ? "\(element.bbox[0]),\(element.bbox[1])"
+                : "?,?"
+            let textSuffix = element.text.flatMap { text -> String? in
+                let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedText.isEmpty else { return nil }
+                // Trim verbose OCR text: 60 chars keeps headings + button
+                // labels intact without dragging entire paragraphs into
+                // the planner prompt.
+                let truncatedText = trimmedText.count > 60
+                    ? String(trimmedText.prefix(60)) + "…"
+                    : trimmedText
+                return "|\(truncatedText)"
+            } ?? ""
+            return "\(element.role)|\(coordinateText)|\(element.label)\(textSuffix)"
+        }
+        let elementSummaryText = elementSummaryLines.joined(separator: "\n")
+        let elementCountSummary = analysis.elements.count > maxElementsRendered
+            ? "top \(maxElementsRendered) of \(analysis.elements.count)"
+            : "\(analysis.elements.count)"
+        return """
+        === \(screenLabel) (\(elementCountSummary) elements) ===
+        \(elementSummaryText)
+        """
+    }
+
+    /// SHA256 of the JPEG byte stream. Stable across runs, ~5ms for a
+    /// 1 MB capture on Apple Silicon. Used as the cache key for the
+    /// per-screen VLM analysis — if the pixels didn't change, the
+    /// element map didn't either.
+    nonisolated private static func computePixelHash(for jpegData: Data) -> String {
+        let digest = SHA256.hash(data: jpegData)
+        return digest.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Kicks off the screen-context pre-warm at PTT press. By the time
+    /// the user releases (~2-5s of speech), the VLM + OCR have usually
+    /// finished — so the planner can start immediately without waiting.
+    /// Cancellable: a quick press-release replaces the task with a new
+    /// one or nil.
+    private func startScreenContextPrewarmIfEnabled() {
+        prewarmedScreenContextTask?.cancel()
+        guard useLocalVLMForScreenContext else {
+            prewarmedScreenContextTask = nil
+            print("👁️  Skipping prewarm — Read My Screen is off")
+            return
+        }
+        // Snapshot the dependencies so the detached task doesn't have
+        // to hop back to MainActor for them.
+        let vlmClient = localVLMClient
+        let ocrClient = visionOCRClient
+        prewarmedScreenContextTask = Task { [weak self] in
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen })
+                    ?? screenCaptures.first else {
+                    return nil
+                }
+
+                // Hash check — reuse cached analysis if the screen
+                // hasn't changed since last turn. Cache lookups are
+                // MainActor-bound so we hop briefly.
+                let pixelHash = Self.computePixelHash(for: cursorScreenCapture.imageData)
+                let cachedAnalysis = await MainActor.run { () -> LocalVLMScreenAnalysis? in
+                    guard let self else { return nil }
+                    if let cached = self.perScreenAnalysisCache[cursorScreenCapture.label],
+                       cached.pixelHash == pixelHash {
+                        return cached.analysis
+                    }
+                    return nil
+                }
+
+                if let cachedAnalysis {
+                    print("👁️  Prewarm cache HIT for \(cursorScreenCapture.label)")
+                    return PrewarmedScreenContext(
+                        screenCaptures: [cursorScreenCapture],
+                        enrichedAnalysesByScreenLabel: [cursorScreenCapture.label: cachedAnalysis]
+                    )
+                }
+
+                print("👁️  Prewarm: VLM + OCR running in parallel…")
+                // No transcript yet so userIntent is generic. Slight
+                // quality loss vs query-aware prioritisation, but the
+                // perceived-latency win is large.
+                async let vlmAnalysisFuture = vlmClient.analyzeScreenshot(
+                    screenshotImageData: cursorScreenCapture.imageData,
+                    userIntent: "general screen analysis"
+                )
+                async let ocrBoxesFuture = ocrClient.recognizeText(
+                    in: cursorScreenCapture.imageData,
+                    screenshotWidthInPixels: cursorScreenCapture.screenshotWidthInPixels,
+                    screenshotHeightInPixels: cursorScreenCapture.screenshotHeightInPixels
+                )
+
+                let vlmAnalysis: LocalVLMScreenAnalysis
+                do {
+                    vlmAnalysis = try await vlmAnalysisFuture
+                } catch {
+                    print("⚠️ Prewarm VLM failed: \(error.localizedDescription)")
+                    // Fall back to OCR-only context
+                    let ocrBoxesFallback = (try? await ocrBoxesFuture) ?? []
+                    let descriptionFromOCR = ocrBoxesFallback.prefix(8)
+                        .map { $0.text }
+                        .joined(separator: " · ")
+                    let ocrOnlyAnalysis = LocalVLMScreenAnalysis(
+                        elements: PaceScreenContextMerger.enrich(
+                            vlmAnalysis: LocalVLMScreenAnalysis(elements: [], description: ""),
+                            with: ocrBoxesFallback
+                        ).elements,
+                        description: descriptionFromOCR.isEmpty
+                            ? "VLM failed; OCR text only."
+                            : "VLM failed. OCR text snippets: \(descriptionFromOCR)"
+                    )
+                    return PrewarmedScreenContext(
+                        screenCaptures: [cursorScreenCapture],
+                        enrichedAnalysesByScreenLabel: [cursorScreenCapture.label: ocrOnlyAnalysis]
+                    )
+                }
+
+                let ocrBoxes = (try? await ocrBoxesFuture) ?? []
+                let enriched = PaceScreenContextMerger.enrich(
+                    vlmAnalysis: vlmAnalysis,
+                    with: ocrBoxes
+                )
+
+                // Update cache for next turn.
+                await MainActor.run { [weak self] in
+                    self?.perScreenAnalysisCache[cursorScreenCapture.label] = CachedScreenAnalysis(
+                        pixelHash: pixelHash,
+                        analysis: enriched,
+                        capturedAt: Date()
+                    )
+                }
+                print("👁️  Prewarm complete: \(enriched.elements.count) elements (\(ocrBoxes.count) OCR boxes merged)")
+
+                return PrewarmedScreenContext(
+                    screenCaptures: [cursorScreenCapture],
+                    enrichedAnalysesByScreenLabel: [cursorScreenCapture.label: enriched]
+                )
+            } catch {
+                print("⚠️ Prewarm failed: \(error.localizedDescription)")
+                return nil
+            }
+        }
+    }
+
+    /// If the cursor is in transient mode (user toggled "Show Pace" off),
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
     private func scheduleTransientHideIfNeeded() {
-        guard !isClickyCursorEnabled && isOverlayVisible else { return }
+        guard !isPaceCursorEnabled && isOverlayVisible else { return }
 
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while ttsClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -755,272 +1305,14 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// Speaks a hardcoded error message via the system NSSpeechSynthesizer
+    /// when the main planner/TTS path fails — independent of LM Studio and
+    /// the main TTS pipeline so the user always hears something.
     private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
+        let utterance = "Something went wrong on my end. Check the console for details."
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
     }
 
-    // MARK: - Point Tag Parsing
-
-    /// Result of parsing a [POINT:...] tag from Claude's response.
-    struct PointingParseResult {
-        /// The response text with the [POINT:...] tag removed — this is what gets spoken.
-        let spokenText: String
-        /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
-        let coordinate: CGPoint?
-        /// Short label describing the element (e.g. "run button"), or "none".
-        let elementLabel: String?
-        /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
-        let screenNumber: Int?
-    }
-
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
-    /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
-    static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
-
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
-            // No tag found at all
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
-        }
-
-        // Remove the tag from the spoken text
-        let tagRange = Range(match.range, in: responseText)!
-        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Check if it's [POINT:none]
-        guard match.numberOfRanges >= 3,
-              let xRange = Range(match.range(at: 1), in: responseText),
-              let yRange = Range(match.range(at: 2), in: responseText),
-              let x = Double(responseText[xRange]),
-              let y = Double(responseText[yRange]) else {
-            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil)
-        }
-
-        var elementLabel: String? = nil
-        if match.numberOfRanges >= 4, let labelRange = Range(match.range(at: 3), in: responseText) {
-            elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-        }
-
-        var screenNumber: Int? = nil
-        if match.numberOfRanges >= 5, let screenRange = Range(match.range(at: 4), in: responseText) {
-            screenNumber = Int(responseText[screenRange])
-        }
-
-        return PointingParseResult(
-            spokenText: spokenText,
-            coordinate: CGPoint(x: x, y: y),
-            elementLabel: elementLabel,
-            screenNumber: screenNumber
-        )
-    }
-
-    // MARK: - Onboarding Video
-
-    /// Sets up the onboarding video player, starts playback, and schedules
-    /// the demo interaction at 40s. Called by BlueCursorView when onboarding starts.
-    func setupOnboardingVideo() {
-        guard let videoURL = URL(string: "https://stream.mux.com/e5jB8UuSrtFABVnTHCR7k3sIsmcUHCyhtLu1tzqLlfs.m3u8") else { return }
-
-        let player = AVPlayer(url: videoURL)
-        player.isMuted = false
-        player.volume = 0.0
-        self.onboardingVideoPlayer = player
-        self.showOnboardingVideo = true
-        self.onboardingVideoOpacity = 0.0
-
-        // Start playback immediately — the video plays while invisible,
-        // then we fade in both the visual and audio over 1s.
-        player.play()
-
-        // Wait for SwiftUI to mount the view, then set opacity to 1.
-        // The .animation modifier on the view handles the actual animation.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.onboardingVideoOpacity = 1.0
-            // Fade audio volume from 0 → 1 over 2s to match visual fade
-            self.fadeInVideoAudio(player: player, targetVolume: 1.0, duration: 2.0)
-        }
-
-        // At 40 seconds into the video, trigger the onboarding demo where
-        // Clicky flies to something interesting on screen and comments on it
-        let demoTriggerTime = CMTime(seconds: 40, preferredTimescale: 600)
-        onboardingDemoTimeObserver = player.addBoundaryTimeObserver(
-            forTimes: [NSValue(time: demoTriggerTime)],
-            queue: .main
-        ) { [weak self] in
-            ClickyAnalytics.trackOnboardingDemoTriggered()
-            self?.performOnboardingDemoInteraction()
-        }
-
-        // Fade out and clean up when the video finishes
-        onboardingVideoEndObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.didPlayToEndTimeNotification,
-            object: player.currentItem,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            ClickyAnalytics.trackOnboardingVideoCompleted()
-            self.onboardingVideoOpacity = 0.0
-            // Wait for the 2s fade-out animation to complete before tearing down
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                self.tearDownOnboardingVideo()
-                // After the video disappears, stream in the prompt to try talking
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    self.startOnboardingPromptStream()
-                }
-            }
-        }
-    }
-
-    func tearDownOnboardingVideo() {
-        showOnboardingVideo = false
-        if let timeObserver = onboardingDemoTimeObserver {
-            onboardingVideoPlayer?.removeTimeObserver(timeObserver)
-            onboardingDemoTimeObserver = nil
-        }
-        onboardingVideoPlayer?.pause()
-        onboardingVideoPlayer = nil
-        if let observer = onboardingVideoEndObserver {
-            NotificationCenter.default.removeObserver(observer)
-            onboardingVideoEndObserver = nil
-        }
-    }
-
-    private func startOnboardingPromptStream() {
-        let message = "press control + option and introduce yourself"
-        onboardingPromptText = ""
-        showOnboardingPrompt = true
-        onboardingPromptOpacity = 0.0
-
-        withAnimation(.easeIn(duration: 0.4)) {
-            onboardingPromptOpacity = 1.0
-        }
-
-        var currentIndex = 0
-        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
-            guard currentIndex < message.count else {
-                timer.invalidate()
-                // Auto-dismiss after 10 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
-                    guard self.showOnboardingPrompt else { return }
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        self.onboardingPromptOpacity = 0.0
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        self.showOnboardingPrompt = false
-                        self.onboardingPromptText = ""
-                    }
-                }
-                return
-            }
-            let index = message.index(message.startIndex, offsetBy: currentIndex)
-            self.onboardingPromptText.append(message[index])
-            currentIndex += 1
-        }
-    }
-
-    /// Gradually raises an AVPlayer's volume from its current level to the
-    /// target over the specified duration, creating a smooth audio fade-in.
-    private func fadeInVideoAudio(player: AVPlayer, targetVolume: Float, duration: Double) {
-        let steps = 20
-        let stepInterval = duration / Double(steps)
-        let volumeIncrement = (targetVolume - player.volume) / Float(steps)
-        var stepsRemaining = steps
-
-        Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { timer in
-            stepsRemaining -= 1
-            player.volume += volumeIncrement
-
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.volume = targetVolume
-            }
-        }
-    }
-
-    // MARK: - Onboarding Demo Interaction
-
-    private static let onboardingDemoSystemPrompt = """
-    you're clicky, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
-
-    make a short quirky 3-6 word observation about the specific thing you picked — something fun, playful, or curious that shows you actually read/recognized it. no emojis ever. NEVER quote or repeat text you see on screen — just react to it. keep it to 6 words max, no exceptions.
-
-    CRITICAL COORDINATE RULE: you MUST only pick elements near the CENTER of the screen. your x coordinate must be between 20%-80% of the image width. your y coordinate must be between 20%-80% of the image height. do NOT pick anything in the top 20%, bottom 20%, left 20%, or right 20% of the screen. no menu bar items, no dock icons, no sidebar items, no items near any edge. only things clearly in the middle area of the screen. if the only interesting things are near the edges, pick something boring in the center instead.
-
-    respond with ONLY your short comment followed by the coordinate tag. nothing else. all lowercase.
-
-    format: your comment [POINT:x,y:label]
-
-    the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. origin (0,0) is top-left. x increases rightward, y increases downward.
-    """
-
-    /// Captures a screenshot and asks Claude to find something interesting to
-    /// point at, then triggers the buddy's flight animation. Used during
-    /// onboarding to demo the pointing feature while the intro video plays.
-    func performOnboardingDemoInteraction() {
-        // Don't interrupt an active voice response
-        guard voiceState == .idle || voiceState == .responding else { return }
-
-        Task {
-            do {
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-
-                // Only send the cursor screen so Claude can't pick something
-                // on a different monitor that we can't point at.
-                guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
-                    print("🎯 Onboarding demo: no cursor screen found")
-                    return
-                }
-
-                let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
-                let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
-
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.onboardingDemoSystemPrompt,
-                    userPrompt: "look around my screen and find something interesting to point at",
-                    onTextChunk: { _ in }
-                )
-
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-
-                guard let pointCoordinate = parseResult.coordinate else {
-                    print("🎯 Onboarding demo: no element to point at")
-                    return
-                }
-
-                let screenshotWidth = CGFloat(cursorScreenCapture.screenshotWidthInPixels)
-                let screenshotHeight = CGFloat(cursorScreenCapture.screenshotHeightInPixels)
-                let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
-                let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
-                let displayFrame = cursorScreenCapture.displayFrame
-
-                let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-                let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-                let appKitY = displayHeight - displayLocalY
-                let globalLocation = CGPoint(
-                    x: displayLocalX + displayFrame.origin.x,
-                    y: appKitY + displayFrame.origin.y
-                )
-
-                // Set custom bubble text so the pointing animation uses Claude's
-                // comment instead of a random phrase
-                detectedElementBubbleText = parseResult.spokenText
-                detectedElementScreenLocation = globalLocation
-                detectedElementDisplayFrame = displayFrame
-                print("🎯 Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
-            } catch {
-                print("⚠️ Onboarding demo error: \(error)")
-            }
-        }
-    }
 }

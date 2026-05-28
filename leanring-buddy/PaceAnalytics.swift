@@ -1,5 +1,5 @@
 //
-//  ClickyAnalytics.swift
+//  PaceAnalytics.swift
 //  leanring-buddy
 //
 //  Centralized PostHog analytics wrapper. All event names and properties
@@ -9,7 +9,7 @@
 import Foundation
 import PostHog
 
-enum ClickyAnalytics {
+enum PaceAnalytics {
 
     // MARK: - Setup
 
@@ -48,7 +48,7 @@ enum ClickyAnalytics {
         PostHogSDK.shared.capture("onboarding_video_completed")
     }
 
-    /// The 40s onboarding demo interaction where Clicky points at something.
+    /// The 40s onboarding demo interaction where Pace points at something.
     static func trackOnboardingDemoTriggered() {
         PostHogSDK.shared.capture("onboarding_demo_triggered")
     }

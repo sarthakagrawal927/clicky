@@ -27,13 +27,29 @@ protocol BuddyTranscriptionProvider {
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession
+
+    /// Optional: pre-load any heavy models so the first push-to-talk
+    /// doesn't pay the cold-load cost. `onReady` is invoked on the
+    /// MainActor exactly once when the model is fully loaded and the
+    /// next session start won't block. Default no-op; WhisperKit
+    /// overrides to kick off its CoreML compile / weight load. Apple
+    /// Speech etc. fire `onReady` synchronously since they have nothing
+    /// to warm up.
+    func warmUpModelInBackground(onReady: @escaping @Sendable @MainActor () -> Void)
+}
+
+extension BuddyTranscriptionProvider {
+    func warmUpModelInBackground(onReady: @escaping @Sendable @MainActor () -> Void) {
+        // Default: nothing to warm. Fire ready immediately so callers
+        // gating PTT on this flag don't get stuck.
+        Task { @MainActor in onReady() }
+    }
 }
 
 enum BuddyTranscriptionProviderFactory {
     private enum PreferredProvider: String {
-        case assemblyAI = "assemblyai"
-        case openAI = "openai"
         case appleSpeech = "apple"
+        case whisperKit = "whisperkit"
     }
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
@@ -48,51 +64,12 @@ enum BuddyTranscriptionProviderFactory {
             .lowercased()
         let preferredProvider = preferredProviderRawValue.flatMap(PreferredProvider.init(rawValue:))
 
-        let assemblyAIProvider = AssemblyAIStreamingTranscriptionProvider()
-        let openAIProvider = OpenAIAudioTranscriptionProvider()
-
-        if preferredProvider == .appleSpeech {
-            return AppleSpeechTranscriptionProvider()
-        }
-
-        if preferredProvider == .assemblyAI {
-            if assemblyAIProvider.isConfigured {
-                return assemblyAIProvider
+        if preferredProvider == .whisperKit {
+            let whisperKitProvider = WhisperKitTranscriptionProvider()
+            if whisperKitProvider.isConfigured {
+                return whisperKitProvider
             }
-
-            print("⚠️ Transcription: AssemblyAI preferred but not configured, falling back")
-
-            if openAIProvider.isConfigured {
-                print("⚠️ Transcription: using OpenAI as fallback")
-                return openAIProvider
-            }
-
-            print("⚠️ Transcription: using Apple Speech as fallback")
-            return AppleSpeechTranscriptionProvider()
-        }
-
-        if preferredProvider == .openAI {
-            if openAIProvider.isConfigured {
-                return openAIProvider
-            }
-
-            print("⚠️ Transcription: OpenAI preferred but not configured, falling back")
-
-            if assemblyAIProvider.isConfigured {
-                print("⚠️ Transcription: using AssemblyAI as fallback")
-                return assemblyAIProvider
-            }
-
-            print("⚠️ Transcription: using Apple Speech as fallback")
-            return AppleSpeechTranscriptionProvider()
-        }
-
-        if assemblyAIProvider.isConfigured {
-            return assemblyAIProvider
-        }
-
-        if openAIProvider.isConfigured {
-            return openAIProvider
+            print("⚠️ Transcription: WhisperKit preferred but not configured, falling back to Apple Speech")
         }
 
         return AppleSpeechTranscriptionProvider()

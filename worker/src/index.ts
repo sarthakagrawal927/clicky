@@ -1,16 +1,21 @@
 /**
- * Clicky Proxy Worker
+ * Pace Proxy Worker
  *
- * Proxies requests to Claude and ElevenLabs APIs so the app never
- * ships with raw API keys. Keys are stored as Cloudflare secrets.
+ * Optional proxy for the OPTIONAL cloud STT/TTS providers. The local
+ * stack (WhisperKit STT, AVSpeechSynthesizer TTS, LM Studio VLM +
+ * planner) doesn't talk to this Worker at all.
+ *
+ * The original /chat route to Anthropic has been removed — pace no
+ * longer depends on Claude. If you want to bring a cloud LLM back in,
+ * add a conformer to BuddyPlannerClient instead of routing through the
+ * Worker.
  *
  * Routes:
- *   POST /chat  → Anthropic Messages API (streaming)
- *   POST /tts   → ElevenLabs TTS API
+ *   POST /tts               → ElevenLabs TTS API
+ *   POST /transcribe-token  → AssemblyAI realtime websocket token
  */
 
 interface Env {
-  ANTHROPIC_API_KEY: string;
   ELEVENLABS_API_KEY: string;
   ELEVENLABS_VOICE_ID: string;
   ASSEMBLYAI_API_KEY: string;
@@ -25,10 +30,6 @@ export default {
     }
 
     try {
-      if (url.pathname === "/chat") {
-        return await handleChat(request, env);
-      }
-
       if (url.pathname === "/tts") {
         return await handleTTS(request, env);
       }
@@ -47,37 +48,6 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
-
-async function handleChat(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body,
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[/chat] Anthropic API error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, {
-      status: response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "text/event-stream",
-      "cache-control": "no-cache",
-    },
-  });
-}
 
 async function handleTranscribeToken(env: Env): Promise<Response> {
   const response = await fetch(
