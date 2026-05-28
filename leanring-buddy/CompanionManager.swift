@@ -539,12 +539,22 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
+            currentResponseTask = nil
             ttsClient.stopPlayback()
             // Clear the streaming-TTS dispatch state so the new turn
             // starts fresh — without this, the diff tracker would think
             // half of the previous reply had already been queued.
             streamingSentenceTTSPipeline.resetForNewTurn()
             clearDetectedElementLocation()
+
+            // Force voice state back to idle BEFORE the dictation observer
+            // sees the new recording flags. The observer at L489 has
+            // `guard voiceState != .responding else { return }` which
+            // means if the prior turn's task hasn't yet cleaned up to .idle,
+            // the new press silently won't transition to .listening — that
+            // was the "had to repeat it once" bug. Forcing idle here unblocks
+            // the observer's normal state transitions for the new turn.
+            voiceState = .idle
     
 
             PaceAnalytics.trackPushToTalkStarted()
