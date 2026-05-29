@@ -66,12 +66,6 @@ enum BuddyPlannerClientFactory {
         /// today). Current default — Qwen3-30B-A3B via LM Studio scored
         /// 15/15 on the FM eval set at 925ms mean.
         case local = "local"
-        /// In-process mlx-swift-lm planner. Same Qwen3-30B-A3B model but
-        /// loaded into Pace's address space, eliminating HTTP roundtrip
-        /// and LM Studio config drift. Requires the mlx-swift-examples
-        /// Swift Package + MLX-format model weights — see
-        /// AppleMLXPlannerClient for setup notes.
-        case appleMLX = "appleMLX"
     }
 
     /// Resolve the active planner from Info.plist key `PlannerProvider`.
@@ -97,8 +91,6 @@ enum BuddyPlannerClientFactory {
             let localPlanner = LocalPlannerClient.makeFromInfoPlist()
             print("🧠 Planner: using \(localPlanner.displayName)")
             return localPlanner
-        case .appleMLX:
-            return makeAppleMLXPlannerOrFallback()
         case .appleFoundationModels:
             return makeFoundationModelsPlannerOrFallback()
         case .none:
@@ -109,26 +101,6 @@ enum BuddyPlannerClientFactory {
             print("🧠 Planner: using \(localPlanner.displayName) (default)")
             return localPlanner
         }
-    }
-
-    /// Construct the mlx-swift-lm planner only if both the SPM
-    /// dependency and the model weights are present. Otherwise log an
-    /// actionable message and fall back to LocalPlannerClient. Same
-    /// no-silent-degradation contract as the FoundationModels fallback.
-    @MainActor
-    private static func makeAppleMLXPlannerOrFallback() -> any BuddyPlannerClient {
-        let mlxPlanner = AppleMLXPlannerClient()
-        if mlxPlanner.isConfigured {
-            print("🧠 Planner: using \(mlxPlanner.displayName)")
-            return mlxPlanner
-        }
-        if let actionableHint = mlxPlanner.unavailableExplanation {
-            print("⚠️  Planner: AppleMLX requested but unavailable —")
-            print("    → \(actionableHint)")
-        }
-        let localPlanner = LocalPlannerClient.makeFromInfoPlist()
-        print("🧠 Planner: falling back to \(localPlanner.displayName)")
-        return localPlanner
     }
 
     /// Construct the Foundation Models planner only if `SystemLanguageModel
