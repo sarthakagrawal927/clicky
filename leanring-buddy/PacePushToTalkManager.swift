@@ -243,7 +243,6 @@ final class PacePushToTalkManager: NSObject, ObservableObject {
     private var hasFinishedCurrentDictationSession = false
     private var finalizeFallbackWorkItem: DispatchWorkItem?
     private var pendingStartRequestIdentifier = UUID()
-    private var contextualKeyterms: [String] = []
     private var lastRecordedAudioPowerSampleDate = Date.distantPast
     private var activePermissionRequestTask: Task<Bool, Never>?
     /// Timestamp of the last completed permission request, used to debounce
@@ -443,7 +442,6 @@ final class PacePushToTalkManager: NSObject, ObservableObject {
         print("🎙️ PacePushToTalkManager: opening transcription provider \(transcriptionProvider.displayName)")
 
         let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
-            keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
                     self?.latestRecognizedText = transcriptText
@@ -611,41 +609,6 @@ final class PacePushToTalkManager: NSObject, ObservableObject {
         )
         microphoneButtonRecordingStartedAt = nil
         lastRecordedAudioPowerSampleDate = .distantPast
-    }
-
-    private func buildTranscriptionKeyterms() -> [String] {
-        let baseKeyterms = [
-            "makesomething",
-            "Learning Buddy",
-            "Codex",
-            "Claude",
-            "Anthropic",
-            "OpenAI",
-            "SwiftUI",
-            "Xcode",
-            "Vercel",
-            "Next.js",
-            "localhost"
-        ]
-
-        let combinedKeyterms = baseKeyterms + contextualKeyterms
-        var uniqueNormalizedKeyterms = Set<String>()
-        var orderedKeyterms: [String] = []
-
-        for keyterm in combinedKeyterms {
-            let trimmedKeyterm = keyterm.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedKeyterm.isEmpty else { continue }
-
-            let normalizedKeyterm = trimmedKeyterm.lowercased()
-            if uniqueNormalizedKeyterms.contains(normalizedKeyterm) {
-                continue
-            }
-
-            uniqueNormalizedKeyterms.insert(normalizedKeyterm)
-            orderedKeyterms.append(trimmedKeyterm)
-        }
-
-        return orderedKeyterms
     }
 
     private func updateAudioPowerLevel(from audioBuffer: AVAudioPCMBuffer) {

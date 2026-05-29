@@ -31,12 +31,6 @@ final class StreamingSentenceTTSPipeline {
     /// clipped.
     private let minimumChunkCharacterCount: Int = 8
 
-    /// Once we've already dispatched at least one TTS chunk for this
-    /// turn, subsequent dispatches can use a lower bar — sentence
-    /// boundaries instead of clause boundaries, since the user is
-    /// already hearing audio and the cost of waiting is lower.
-    private let minimumSubsequentChunkCharacterCount: Int = 16
-
     /// Timestamp of the moment the user committed to a query — typically
     /// PTT-release. Set externally via `markIntentCommitted()`. Used to
     /// log time-to-first-spoken-word (TTFSW), the headline latency

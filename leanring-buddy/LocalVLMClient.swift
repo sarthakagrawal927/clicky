@@ -236,24 +236,6 @@ final class LocalVLMClient {
         return try Self.parseChatCompletionResponse(responseData)
     }
 
-    /// True when an LM Studio (or compatible) server responds at `baseURL`.
-    /// Use from the UI to surface "VLM not running" hints to the user
-    /// without making them speak first.
-    func isLocalVLMReachable() async -> Bool {
-        let modelsURL = baseURL.appendingPathComponent("models")
-        var request = URLRequest(url: modelsURL)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 2
-
-        do {
-            let (_, response) = try await urlSession.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else { return false }
-            return (200...299).contains(httpResponse.statusCode)
-        } catch {
-            return false
-        }
-    }
-
     // MARK: - Response parsing
 
     private static func parseChatCompletionResponse(_ responseData: Data) throws -> LocalVLMScreenAnalysis {

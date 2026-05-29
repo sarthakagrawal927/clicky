@@ -20,11 +20,8 @@ struct AppleSpeechTranscriptionProviderError: LocalizedError {
 final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
     let displayName = "Apple Speech"
     let requiresSpeechRecognitionPermission = true
-    let isConfigured = true
-    let unavailableExplanation: String? = nil
 
     func startStreamingSession(
-        keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void

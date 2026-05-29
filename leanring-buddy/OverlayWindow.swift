@@ -644,17 +644,6 @@ struct BlueCursorView: View {
         }
     }
 
-    /// Cancels an in-progress navigation because the user moved the cursor.
-    private func cancelNavigationAndResumeFollowing() {
-        navigationAnimationTimer?.invalidate()
-        navigationAnimationTimer = nil
-        navigationBubbleText = ""
-        navigationBubbleOpacity = 0.0
-        navigationBubbleScale = 1.0
-        buddyFlightScale = 1.0
-        finishNavigationAndResumeFollowing()
-    }
-
     /// Returns the buddy to normal cursor-following mode after navigation completes.
     private func finishNavigationAndResumeFollowing() {
         navigationAnimationTimer?.invalidate()
@@ -760,9 +749,6 @@ class OverlayWindowManager {
         })
     }
 
-    func isShowingOverlay() -> Bool {
-        return !overlayWindows.isEmpty
-    }
 }
 
 // (Onboarding-video player NSViewRepresentable removed — Pace no longer

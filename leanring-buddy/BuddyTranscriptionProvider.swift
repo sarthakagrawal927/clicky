@@ -18,11 +18,8 @@ protocol BuddyStreamingTranscriptionSession: AnyObject {
 protocol BuddyTranscriptionProvider {
     var displayName: String { get }
     var requiresSpeechRecognitionPermission: Bool { get }
-    var isConfigured: Bool { get }
-    var unavailableExplanation: String? { get }
 
     func startStreamingSession(
-        keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
