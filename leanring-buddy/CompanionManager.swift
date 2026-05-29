@@ -805,8 +805,17 @@ final class CompanionManager: ObservableObject {
                     guard !Task.isCancelled else { return }
 
                     // 1. Capture all connected screens
+                    let screenCaptureStartedAt = Date()
                     let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
                     guard !Task.isCancelled else { return }
+                    let screenCaptureElapsedMs = Int(
+                        Date().timeIntervalSince(screenCaptureStartedAt) * 1000
+                    )
+                    // Per-stage timing — combined with TTFT/TTFSW these
+                    // explain where each turn's budget actually goes.
+                    // Useful when verifying that a perceived slowdown is
+                    // (e.g.) screen capture vs. planner inference.
+                    print("⏱  Step \(stepIndex) screen capture: \(screenCaptureElapsedMs)ms")
 
                     // 2. Build image labels with the actual screenshot pixel
                     //    dimensions so the planner's coordinate space matches
@@ -819,10 +828,15 @@ final class CompanionManager: ObservableObject {
                     // 3. Optionally enrich the user prompt with the local VLM's
                     //    structured element map — cuts perception cost on the
                     //    planner side and is essential when the planner is text-only.
+                    let screenContextStartedAt = Date()
                     let userPromptForPlanner = await buildUserPromptWithLocalVLMContextIfEnabled(
                         transcript: currentTurnUserPrompt,
                         screenCaptures: screenCaptures
                     )
+                    let screenContextElapsedMs = Int(
+                        Date().timeIntervalSince(screenContextStartedAt) * 1000
+                    )
+                    print("⏱  Step \(stepIndex) screen context (VLM + OCR + AX): \(screenContextElapsedMs)ms")
 
                     // Diagnostic: print the first 5 element lines we're
                     // about to send to the planner. The single most
