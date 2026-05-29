@@ -200,6 +200,53 @@ def lms_ps_loaded_identifiers() -> list[str]:
     return loaded
 
 
+def lms_ps_model_configs() -> dict[str, dict[str, str]]:
+    """Returns per-model runtime configuration as parsed from `lms ps`.
+
+    Why this matters: today's latency regression was hiding behind
+    a CONTEXT=32768 / PARALLEL=32 planner config (vs the baseline
+    4096/4). With the config visible upfront, future regressions of
+    that shape are obvious in the diag output instead of requiring
+    a separate `lms ps` to spot.
+
+    Output shape: {identifier: {column_name: column_value, ...}}.
+    Returns empty dict if `lms ps` fails or has an unexpected format.
+    """
+    completed = subprocess.run(
+        [LMS_BIN, "ps"], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        return {}
+
+    header_line: str | None = None
+    body_lines: list[str] = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        if line.lower().startswith("identifier"):
+            header_line = line
+            continue
+        if header_line is None:
+            continue
+        body_lines.append(line)
+
+    if header_line is None:
+        return {}
+
+    column_names = [token.strip().lower() for token in re.split(r"\s{2,}", header_line.strip())]
+    configs: dict[str, dict[str, str]] = {}
+    for body_line in body_lines:
+        values = [token.strip() for token in re.split(r"\s{2,}", body_line.strip())]
+        if not values:
+            continue
+        identifier = values[0]
+        configs[identifier] = {
+            column_names[index]: values[index]
+            for index in range(min(len(column_names), len(values)))
+        }
+    return configs
+
+
 def lms_load(identifier: str) -> bool:
     print(f"  ⬇ loading {identifier} …", flush=True)
     completed = subprocess.run(
@@ -941,6 +988,23 @@ def main(argv: list[str]) -> int:
             return 1
     after_load = lms_ps_loaded_identifiers()
     print(f"  after:  {after_load or '(none)'}")
+
+    # Print runtime config (CONTEXT, PARALLEL, TTL) for the two models
+    # so unusual settings are visible upfront. Pace's reference baseline
+    # is context=4096, parallel=4 for the planner. CONTEXT=32768 +
+    # PARALLEL=32 would mean ~8× the memory footprint per model and
+    # explains a latency regression at a glance.
+    model_configs = lms_ps_model_configs()
+    for model_identifier in (vlm_model, planner_model):
+        config = model_configs.get(model_identifier, {})
+        if config:
+            context_value = config.get("context", "?")
+            parallel_value = config.get("parallel", "?")
+            ttl_value = config.get("ttl", "(no ttl)") or "(no ttl)"
+            print(
+                f"  {model_identifier}: context={context_value}, "
+                f"parallel={parallel_value}, ttl={ttl_value}"
+            )
 
     both_loaded = vlm_model in after_load and planner_model in after_load
     if not both_loaded:
