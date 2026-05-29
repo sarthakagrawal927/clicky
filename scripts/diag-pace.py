@@ -517,6 +517,89 @@ def diagnose_thrash(
     return results
 
 
+def diagnose_planner_behavior(planner_model: str) -> list[CheckResult]:
+    """Delegate to eval-planners.py for the configured planner and parse
+    its summary line so a single diag-pace.py call asserts behavior
+    regressions alongside runtime health.
+
+    `eval-planners.py` writes a summary like:
+
+        - **qwen/qwen3-30b-a3b**: 15/15 pass, mean latency 925ms
+
+    We pull pass count and mean latency out of that line and turn them
+    into CheckResult entries with strict thresholds.
+    """
+    print(bold(f"\n▶ Planner behavior eval ({planner_model})"))
+    results: list[CheckResult] = []
+
+    eval_script_path = SCRIPT_DIR / "eval-planners.py"
+    if not eval_script_path.exists():
+        results.append(
+            CheckResult(
+                "planner behavior eval available",
+                False,
+                f"missing: {eval_script_path}",
+            )
+        )
+        return results
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(eval_script_path),
+            "--models",
+            planner_model,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+
+    # Always echo the eval's summary block so a human reader (or me)
+    # can see per-fixture verdicts without scrolling the raw stdout.
+    summary_marker = "### Summary"
+    if summary_marker in completed.stdout:
+        summary_section = completed.stdout.split(summary_marker, 1)[1].strip()
+        # Show only the first ~600 chars to keep diag output focused.
+        print(summary_section[:600])
+
+    pass_pattern = re.compile(
+        rf"\*\*{re.escape(planner_model)}\*\*: (\d+)/(\d+) pass, mean latency (\d+)ms"
+    )
+    pass_match = pass_pattern.search(completed.stdout)
+    if not pass_match:
+        results.append(
+            CheckResult(
+                "planner behavior eval completed",
+                False,
+                f"could not parse summary from eval-planners.py output. stderr head: {completed.stderr[:200]}",
+            )
+        )
+        return results
+
+    passed_count = int(pass_match.group(1))
+    total_count = int(pass_match.group(2))
+    mean_latency_ms = int(pass_match.group(3))
+
+    results.append(
+        CheckResult(
+            "planner passes every fixture",
+            passed_count == total_count,
+            f"{passed_count}/{total_count} pass",
+        )
+    )
+    # Sub-3s mean across the full eval (which includes long-list-pick-target,
+    # the heaviest fixture) is the bar for "snappy enough to ship".
+    results.append(
+        CheckResult(
+            "planner mean eval latency under 3s",
+            mean_latency_ms < 3000,
+            f"{mean_latency_ms}ms",
+        )
+    )
+    return results
+
+
 def diagnose_vlm_json_health(
     base_url: str, vlm_model: str
 ) -> list[CheckResult]:
@@ -580,6 +663,12 @@ def main(argv: list[str]) -> int:
         "--no-load",
         action="store_true",
         help="Skip `lms load` — assume both models are already resident",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Also run the planner behavior eval (delegates to eval-planners.py). "
+        "Adds ~30-60s but catches regressions runtime health alone misses.",
     )
     args = parser.parse_args(argv)
 
@@ -652,7 +741,14 @@ def main(argv: list[str]) -> int:
     # VLM JSON health check (one extra call against the VLM)
     vlm_health_results = diagnose_vlm_json_health(base_url, vlm_model)
 
-    all_results = thrash_results + vlm_health_results
+    # Optional planner behavior eval — slower but catches behavior
+    # regressions thrash + VLM-health alone won't see (e.g. the planner
+    # starts hallucinating element IDs after a prompt change).
+    behavior_results: list[CheckResult] = []
+    if args.eval:
+        behavior_results = diagnose_planner_behavior(planner_model)
+
+    all_results = thrash_results + vlm_health_results + behavior_results
 
     # Summary
     print(bold("\n▶ Summary"))
