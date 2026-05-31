@@ -20,6 +20,7 @@ import SwiftUI
 /// the cached element map — zero VLM cost, instant response.
 private struct CachedScreenAnalysis {
     let pixelHash: String
+    let visualFingerprint: PaceScreenVisualFingerprint?
     let analysis: LocalVLMScreenAnalysis
     let capturedAt: Date
 }
@@ -70,6 +71,7 @@ final class CompanionManager: ObservableObject {
     /// a while.
     private lazy var responseOverlayManager: CompanionResponseOverlayManager = {
         let manager = CompanionResponseOverlayManager()
+        manager.setAnnotationsEnabled(areCursorAnnotationsEnabled)
         manager.setStopButtonCallback { [weak self] in
             self?.handleStopButtonTapped()
         }
@@ -261,6 +263,18 @@ final class CompanionManager: ObservableObject {
     /// Persisted to UserDefaults so the choice survives app restarts.
     @Published var isPaceCursorEnabled: Bool = PaceUserPreferencesStore
         .bool(.isPaceCursorEnabled, default: true)
+
+    /// User preference for whether cursor-adjacent annotation bubbles are
+    /// shown. Turning this off keeps the cursor/tool flow active but hides
+    /// the transcript/response bubble and the small pointer labels.
+    @Published var areCursorAnnotationsEnabled: Bool = PaceUserPreferencesStore
+        .bool(.areCursorAnnotationsEnabled, default: true)
+
+    func setCursorAnnotationsEnabled(_ enabled: Bool) {
+        areCursorAnnotationsEnabled = enabled
+        PaceUserPreferencesStore.setBool(enabled, for: .areCursorAnnotationsEnabled)
+        responseOverlayManager.setAnnotationsEnabled(enabled)
+    }
 
     /// Pace skips the upstream first-run flow entirely — no welcome video,
     /// no email gate, no demo pointing animation. The cursor overlay shows
@@ -1025,17 +1039,21 @@ final class CompanionManager: ObservableObject {
                         voiceState = .responding
                     }
 
-                    // 10. Execute action tags if any.
+                    // 10. Execute tool calls/action tags if any.
+                    var toolObservations: [PaceActionExecutionObservation] = []
                     if !actionParseResult.actions.isEmpty {
                         if actionExecutor.actionsAreEnabled {
                             // Brief settle so the cursor flight visibly arrives
                             // before the synthetic click fires.
                             try? await Task.sleep(nanoseconds: 350_000_000)
                             guard !Task.isCancelled else { return }
-                            await actionExecutor.executeActionSequence(
-                                actionParseResult.actions,
+                            toolObservations = await actionExecutor.executeActionPlan(
+                                actionParseResult.executionPlan,
                                 screenCaptures: screenCaptures
                             )
+                            if !toolObservations.isEmpty {
+                                print("🧰 Tool observations:\n\(PaceActionExecutionObservation.formatForPlanner(toolObservations))")
+                            }
                         } else {
                             print("🤖 \(actionParseResult.actions.count) action(s) parsed but EnableActions is false — exiting loop after this step")
                         }
@@ -1062,7 +1080,17 @@ final class CompanionManager: ObservableObject {
                     guard !Task.isCancelled else { return }
 
                     // Set up the next iteration.
-                    currentTurnUserPrompt = "continue the task. look at the current screen, then either emit the next step's action tags or emit [DONE] if the task is complete."
+                    let toolObservationPromptText = PaceActionExecutionObservation.formatForPlanner(toolObservations)
+                    if toolObservationPromptText.isEmpty {
+                        currentTurnUserPrompt = "continue the task. look at the current screen, then either emit the next step's action tags or emit [DONE] if the task is complete."
+                    } else {
+                        currentTurnUserPrompt = """
+                        tool results:
+                        \(toolObservationPromptText)
+
+                        continue the task. use the tool results and current screen, then either emit the next step's tool calls/action tags or emit [DONE] if the task is complete.
+                        """
+                    }
                     voiceState = .processing
                 }
 
@@ -1185,17 +1213,38 @@ final class CompanionManager: ObservableObject {
         // and misses (need a fresh VLM call). Hash is SHA256 of the JPEG
         // bytes — stable across runs, cheap (~5ms for 1MB).
         var perCaptureCachedAnalysis: [Int: LocalVLMScreenAnalysis] = [:]
-        var capturesToAnalyze: [(captureIndex: Int, capture: CompanionScreenCapture, pixelHash: String)] = []
+        var capturesToAnalyze: [(captureIndex: Int, capture: CompanionScreenCapture, pixelHash: String, visualFingerprint: PaceScreenVisualFingerprint?)] = []
 
         for (captureIndex, capture) in orderedCaptures.enumerated() {
             let pixelHash = Self.computePixelHash(for: capture.imageData)
-            if let cached = perScreenAnalysisCache[capture.label],
-               cached.pixelHash == pixelHash {
-                perCaptureCachedAnalysis[captureIndex] = cached.analysis
-                print("👁️  Cache HIT for \(capture.label) — reusing \(cached.analysis.elements.count) elements")
-            } else {
-                capturesToAnalyze.append((captureIndex, capture, pixelHash))
+            let visualFingerprint = PaceScreenImageDiffer.fingerprint(for: capture.imageData)
+            if let cached = perScreenAnalysisCache[capture.label] {
+                if cached.pixelHash == pixelHash {
+                    perCaptureCachedAnalysis[captureIndex] = cached.analysis
+                    print("👁️  Cache HIT for \(capture.label) — reusing \(cached.analysis.elements.count) elements")
+                    continue
+                }
+
+                if let cachedVisualFingerprint = cached.visualFingerprint,
+                   let visualFingerprint,
+                   let visualDiff = PaceScreenImageDiffer.diff(
+                    from: cachedVisualFingerprint,
+                    to: visualFingerprint
+                   ),
+                   !visualDiff.isMeaningful {
+                    perCaptureCachedAnalysis[captureIndex] = cached.analysis
+                    perScreenAnalysisCache[capture.label] = CachedScreenAnalysis(
+                        pixelHash: pixelHash,
+                        visualFingerprint: visualFingerprint,
+                        analysis: cached.analysis,
+                        capturedAt: Date()
+                    )
+                    print(String(format: "👁️  Visual diff cache HIT for %@ — %.3f changed, %.1f mean delta", capture.label, visualDiff.changedPixelRatio, visualDiff.meanPixelDelta))
+                    continue
+                }
             }
+
+            capturesToAnalyze.append((captureIndex, capture, pixelHash, visualFingerprint))
         }
 
         // Try the AX-tree first on the cursor screen (cheap, ~50ms);
@@ -1204,11 +1253,11 @@ final class CompanionManager: ObservableObject {
         // 2B VLM was failing on every in-loop call last test run,
         // leaving the planner with no screen context and looping on
         // useless scrolls — AX fixes that.
-        var capturesStillNeedingVLM: [(captureIndex: Int, capture: CompanionScreenCapture, pixelHash: String)] = []
+        var capturesStillNeedingVLM: [(captureIndex: Int, capture: CompanionScreenCapture, pixelHash: String, visualFingerprint: PaceScreenVisualFingerprint?)] = []
         var freshAnalysesByCaptureIndex: [Int: LocalVLMScreenAnalysis] = [:]
         if !capturesToAnalyze.isEmpty {
             let axScreenReaderForLoopBody = self.axScreenReader
-            for (captureIndex, capture, pixelHash) in capturesToAnalyze {
+            for (captureIndex, capture, pixelHash, visualFingerprint) in capturesToAnalyze {
                 let axElements = axScreenReaderForLoopBody.readFocusedWindow(
                     scalingToScreenshot: capture
                 )
@@ -1226,11 +1275,12 @@ final class CompanionManager: ObservableObject {
                     freshAnalysesByCaptureIndex[captureIndex] = axBackedAnalysis
                     perScreenAnalysisCache[capture.label] = CachedScreenAnalysis(
                         pixelHash: pixelHash,
+                        visualFingerprint: visualFingerprint,
                         analysis: axBackedAnalysis,
                         capturedAt: Date()
                     )
                 } else {
-                    capturesStillNeedingVLM.append((captureIndex, capture, pixelHash))
+                    capturesStillNeedingVLM.append((captureIndex, capture, pixelHash, visualFingerprint))
                 }
             }
         }
@@ -1241,9 +1291,9 @@ final class CompanionManager: ObservableObject {
         if !capturesStillNeedingVLM.isEmpty {
             print("👁️  Running VLM + OCR on \(capturesStillNeedingVLM.count) screen(s) (AX missed)…")
             let analyses = await withTaskGroup(
-                of: (Int, String, LocalVLMScreenAnalysis?, String).self
+                of: (Int, String, LocalVLMScreenAnalysis?, String, PaceScreenVisualFingerprint?).self
             ) { taskGroup in
-                for (captureIndex, capture, pixelHash) in capturesStillNeedingVLM {
+                for (captureIndex, capture, pixelHash, visualFingerprint) in capturesStillNeedingVLM {
                     taskGroup.addTask { [localVLMClient, visionOCRClient] in
                         // VLM + OCR concurrent. OCR finishes much faster
                         // (~100-200ms); we wait on the VLM and then merge.
@@ -1263,24 +1313,25 @@ final class CompanionManager: ObservableObject {
                                 vlmAnalysis: vlmAnalysis,
                                 with: ocrBoxes
                             )
-                            return (captureIndex, capture.label, enriched, pixelHash)
+                            return (captureIndex, capture.label, enriched, pixelHash, visualFingerprint)
                         } catch {
                             print("⚠️ VLM failed for \(capture.label): \(error.localizedDescription)")
-                            return (captureIndex, capture.label, nil, pixelHash)
+                            return (captureIndex, capture.label, nil, pixelHash, visualFingerprint)
                         }
                     }
                 }
-                var collected: [(Int, String, LocalVLMScreenAnalysis?, String)] = []
+                var collected: [(Int, String, LocalVLMScreenAnalysis?, String, PaceScreenVisualFingerprint?)] = []
                 for await result in taskGroup {
                     collected.append(result)
                 }
                 return collected
             }
-            for (captureIndex, label, maybeAnalysis, pixelHash) in analyses {
+            for (captureIndex, label, maybeAnalysis, pixelHash, visualFingerprint) in analyses {
                 guard let analysis = maybeAnalysis else { continue }
                 freshAnalysesByCaptureIndex[captureIndex] = analysis
                 perScreenAnalysisCache[label] = CachedScreenAnalysis(
                     pixelHash: pixelHash,
+                    visualFingerprint: visualFingerprint,
                     analysis: analysis,
                     capturedAt: Date()
                 )
@@ -1424,17 +1475,36 @@ final class CompanionManager: ObservableObject {
                 // hasn't changed since last turn. Cache lookups are
                 // MainActor-bound so we hop briefly.
                 let pixelHash = Self.computePixelHash(for: cursorScreenCapture.imageData)
+                let visualFingerprint = PaceScreenImageDiffer.fingerprint(for: cursorScreenCapture.imageData)
                 let cachedAnalysis = await MainActor.run { () -> LocalVLMScreenAnalysis? in
                     guard let self else { return nil }
-                    if let cached = self.perScreenAnalysisCache[cursorScreenCapture.label],
-                       cached.pixelHash == pixelHash {
+                    guard let cached = self.perScreenAnalysisCache[cursorScreenCapture.label] else {
+                        return nil
+                    }
+                    if cached.pixelHash == pixelHash {
+                        print("👁️  Prewarm cache HIT for \(cursorScreenCapture.label)")
+                        return cached.analysis
+                    }
+                    if let cachedVisualFingerprint = cached.visualFingerprint,
+                       let visualFingerprint,
+                       let visualDiff = PaceScreenImageDiffer.diff(
+                        from: cachedVisualFingerprint,
+                        to: visualFingerprint
+                       ),
+                       !visualDiff.isMeaningful {
+                        self.perScreenAnalysisCache[cursorScreenCapture.label] = CachedScreenAnalysis(
+                            pixelHash: pixelHash,
+                            visualFingerprint: visualFingerprint,
+                            analysis: cached.analysis,
+                            capturedAt: Date()
+                        )
+                        print(String(format: "👁️  Prewarm visual diff cache HIT for %@ — %.3f changed, %.1f mean delta", cursorScreenCapture.label, visualDiff.changedPixelRatio, visualDiff.meanPixelDelta))
                         return cached.analysis
                     }
                     return nil
                 }
 
                 if let cachedAnalysis {
-                    print("👁️  Prewarm cache HIT for \(cursorScreenCapture.label)")
                     return PrewarmedScreenContext(
                         screenCaptures: [cursorScreenCapture],
                         enrichedAnalysesByScreenLabel: [cursorScreenCapture.label: cachedAnalysis]
@@ -1473,6 +1543,7 @@ final class CompanionManager: ObservableObject {
                     await MainActor.run { [weak self] in
                         self?.perScreenAnalysisCache[cursorScreenCapture.label] = CachedScreenAnalysis(
                             pixelHash: pixelHash,
+                            visualFingerprint: visualFingerprint,
                             analysis: enrichedFromAX,
                             capturedAt: Date()
                         )
@@ -1527,6 +1598,7 @@ final class CompanionManager: ObservableObject {
                 await MainActor.run { [weak self] in
                     self?.perScreenAnalysisCache[cursorScreenCapture.label] = CachedScreenAnalysis(
                         pixelHash: pixelHash,
+                        visualFingerprint: visualFingerprint,
                         analysis: enriched,
                         capturedAt: Date()
                     )

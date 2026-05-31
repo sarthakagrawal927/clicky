@@ -144,30 +144,45 @@ final class StreamingSentenceTTSPipeline {
         let thinkStripped = LocalPlannerClient.stripThinkingBlocks(from: rawAccumulatedText)
         guard !thinkStripped.isEmpty else { return "" }
 
-        // 2. Strip ALL complete action tags + the POINT tag. Partial
+        // 2. Strip ALL complete tool-call blocks, action tags + the POINT tag. Partial
         //    in-progress tags (a `[CLICK` with no closing `]` yet) are
         //    NOT stripped — they remain in the text and will block
         //    sentence-boundary detection until the `]` arrives, which
         //    is exactly what we want (we don't want to speak half of
         //    a tag).
-        let actionStripped = stripCompletedActionTagsForSpeech(from: thinkStripped)
+        let toolCallStripped = stripCompletedToolCallBlocksForSpeech(from: thinkStripped)
+        let actionStripped = stripCompletedActionTagsForSpeech(from: toolCallStripped)
         let pointStripped = stripPointTagForSpeech(from: actionStripped)
 
-        // 3. If there's an open `[` with no closing `]` yet, we can't
-        //    safely speak anything PAST that bracket — the planner
-        //    might emit a tag we'd otherwise speak aloud. Cut at the
-        //    open bracket.
-        let safeFromOpenBracket: String = {
-            guard let lastOpenBracketIndex = pointStripped.lastIndex(of: "[") else {
+        // 3. If there's an open `<tool_calls` or `[` with no matching
+        //    close yet, we can't safely speak anything past it — the
+        //    planner might emit a tool/action we'd otherwise speak aloud.
+        let safeFromOpenToolCallBlock: String = {
+            guard let openToolCallRange = pointStripped.range(
+                of: "<tool_calls",
+                options: [.caseInsensitive, .backwards]
+            ) else {
                 return pointStripped
+            }
+            let afterOpen = openToolCallRange.upperBound
+            if afterOpen < pointStripped.endIndex,
+               pointStripped[afterOpen...].range(of: "</tool_calls>", options: [.caseInsensitive]) != nil {
+                return pointStripped
+            }
+            return String(pointStripped[..<openToolCallRange.lowerBound])
+        }()
+
+        let safeFromOpenBracket: String = {
+            guard let lastOpenBracketIndex = safeFromOpenToolCallBlock.lastIndex(of: "[") else {
+                return safeFromOpenToolCallBlock
             }
             // Is there a closing `]` after it?
-            let afterOpen = pointStripped.index(after: lastOpenBracketIndex)
-            if afterOpen < pointStripped.endIndex,
-               pointStripped[afterOpen...].contains("]") {
-                return pointStripped
+            let afterOpen = safeFromOpenToolCallBlock.index(after: lastOpenBracketIndex)
+            if afterOpen < safeFromOpenToolCallBlock.endIndex,
+               safeFromOpenToolCallBlock[afterOpen...].contains("]") {
+                return safeFromOpenToolCallBlock
             }
-            return String(pointStripped[..<lastOpenBracketIndex])
+            return String(safeFromOpenToolCallBlock[..<lastOpenBracketIndex])
         }()
 
         // 4. Bound to last complete sentence so we don't speak partial
@@ -176,9 +191,23 @@ final class StreamingSentenceTTSPipeline {
         return computeLastSentenceBoundedPrefix(of: safeFromOpenBracket)
     }
 
+    nonisolated private static func stripCompletedToolCallBlocksForSpeech(from text: String) -> String {
+        let pattern = #"<tool_calls>.*?</tool_calls>"#
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else {
+            return text
+        }
+        let entireRange = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(
+            in: text, options: [], range: entireRange, withTemplate: ""
+        )
+    }
+
     nonisolated private static func stripCompletedActionTagsForSpeech(from text: String) -> String {
         // Matches the same tag shapes PaceActionTagParser recognises.
-        let pattern = #"\[(CLICK|DOUBLE_CLICK|TYPE|KEY|SCROLL|DONE):?[^\]]*\]"#
+        let pattern = #"\[(CLICK|DOUBLE_CLICK|TYPE|KEY|SCROLL|OPEN_APP|OPEN_URL|MUSIC|VOLUME|BRIGHTNESS|CALENDAR|REMINDER|DONE):?[^\]]*\]"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return text
         }

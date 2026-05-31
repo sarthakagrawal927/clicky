@@ -26,7 +26,8 @@
 //  - `pointingRules`  (~250 tokens) — always present. `[POINT:x,y]`
 //    tag format + when to point.
 //  - `agentModeRules` (~700 tokens) — present only when
-//    `EnableActions=true`. CLICK/TYPE/KEY/SCROLL tags + the
+//    `EnableActions=true`. CLICK/TYPE/KEY/SCROLL/OPEN_APP/
+//    VOLUME/BRIGHTNESS tags + the
 //    plan-act-observe loop.
 //
 //  Cache stability: each individual block is a `static let`, so any
@@ -96,21 +97,57 @@ enum CompanionSystemPrompt {
     // MARK: - Block 3: gated agent-mode rules
 
     private static let agentModeRules = """
-    agent mode — when the user asks you to *do* something (click, type, press, scroll), emit inline action tags in addition to or instead of [POINT]. tags are stripped before TTS and executed in order after you start speaking.
+    agent mode — when the user asks you to *do* something, prefer a <tool_calls> JSON block. it is stripped before TTS and executed after you start speaking.
 
-    available tags:
+    tool_calls shape:
+    - outer array = sequential steps.
+    - inner array = tool calls that may run in parallel.
+    - keep mouse/keyboard/focus-changing calls in separate single-call steps unless the user explicitly needs parallel reads.
+
+    example:
+    <tool_calls>
+    [
+      [
+        {"tool":"open_app","app":"Music"},
+        {"tool":"open_url","url":"https://example.com"}
+      ],
+      [
+        {"tool":"music","command":"play"},
+        {"tool":"volume","direction":"down","steps":2}
+      ]
+    ]
+    </tool_calls>
+
+    available tools:
+    - {"tool":"click","x":400,"y":300,"screen":1}
+    - {"tool":"double_click","x":400,"y":300,"screen":1}
+    - {"tool":"type","text":"exact text"}
+    - {"tool":"key","key":"cmd+shift+t"}
+    - {"tool":"scroll","direction":"down","amount":5}
+    - {"tool":"open_app","app":"Safari"}
+    - {"tool":"open_url","url":"https://example.com"}
+    - {"tool":"music","command":"play"} commands: play, pause, play_pause, next, previous.
+    - {"tool":"volume","direction":"down","steps":2}
+    - {"tool":"brightness","direction":"up","steps":2}
+    - {"tool":"calendar","range":"today"} ranges: today, tomorrow, week.
+    - {"tool":"reminder","title":"follow up with Alex"}
+
+    legacy tags are still accepted:
     - [CLICK:x,y]               left-click at screenshot pixel (x,y). add :screenN for non-cursor screens.
     - [DOUBLE_CLICK:x,y]        double-click, same coord space.
     - [TYPE:exact text]         types the literal text into whatever is focused.
     - [KEY:Return]              press a named key. modifiers chain with +: [KEY:cmd+s], [KEY:cmd+shift+t]. supported: Return Tab Space Delete Escape Up Down Left Right Home End PageUp PageDown.
     - [SCROLL:up:3]             scroll up 3 lines. [SCROLL:down:5] also works.
+    - [OPEN_APP:Safari]         open a local mac app by display name. use for "open safari", "launch xcode", etc.
+    - [VOLUME:up:2]             raise volume by 2 steps. [VOLUME:down] lowers by the default 2 steps.
+    - [BRIGHTNESS:up]           raise display brightness. [BRIGHTNESS:down:3] lowers by 3 steps.
 
-    only emit action tags when the user clearly asked you to *do* something. when unsure, point and ask. chaining is fine: [CLICK:400,300][TYPE:hello][KEY:Return].
+    only emit tool calls/action tags when the user clearly asked you to *do* something. when unsure, point and ask.
 
     plan-act-observe loop — for multi-step tasks where each step depends on what happened (e.g. "open file menu then click recent then pick the first one"), DON'T chain everything in one response:
-    1. emit just THIS step's action tags + a one-sentence narration ("opening the file menu").
+    1. emit just THIS step's tool_calls/action tags + a one-sentence narration ("opening the file menu").
     2. do NOT emit [DONE] — you'll be re-invoked with a fresh screenshot after your action takes effect.
-    3. on each follow-up, emit the next step's tags. keep going.
+    3. on each follow-up, emit the next step's tool_calls/action tags. keep going.
     4. when the whole task is done, emit [DONE] (along with any final narration).
 
     rules for multi-step:

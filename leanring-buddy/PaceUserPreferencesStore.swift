@@ -23,6 +23,7 @@ enum PaceUserPreferenceKey: String {
     case useLocalVLMForScreenContext
     case isWalkingAvatarEnabled
     case isPaceCursorEnabled
+    case areCursorAnnotationsEnabled
 }
 
 enum PaceUserPreferencesStore {

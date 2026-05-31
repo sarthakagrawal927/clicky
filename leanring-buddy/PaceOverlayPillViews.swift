@@ -2,8 +2,10 @@
 //  PaceOverlayPillViews.swift
 //  leanring-buddy
 //
-//  Small, focused SwiftUI views the cursor overlay swaps in based on
-//  voice state:
+//  Small, focused SwiftUI voice-state views retained for reuse. The
+//  current always-visible voice-state animation lives in
+//  PaceMenuBarOverlay.swift so it appears at the notch instead of next
+//  to the cursor:
 //
 //  - `WhisperFlowVoicePillView` replaces the cursor while the user is
 //    holding push-to-talk and speaking. Glassmorphic capsule with
@@ -13,8 +15,7 @@
 //    processing the captured voice input. Codex-style angular spinner.
 //
 //  Extracted from `OverlayWindow.swift` so each visual sits in its own
-//  file with its own tunables; the cursor overlay file no longer
-//  carries 200 lines of pure SwiftUI styling.
+//  file with its own tunables.
 //
 
 import SwiftUI

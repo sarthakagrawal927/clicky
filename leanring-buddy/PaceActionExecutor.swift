@@ -15,6 +15,7 @@
 
 import AppKit
 import CoreGraphics
+import EventKit
 import Foundation
 
 /// A single mouse position expressed in *screenshot pixel space*. The
@@ -45,6 +46,7 @@ final class PaceActionExecutor {
     /// click and drag still go through CGEvent because AX doesn't have
     /// a built-in "double-press" action.
     private let axTargeter = PaceAXTargeter()
+    private let eventStore = EKEventStore()
 
     init() {
         let rawFlag = AppBundleConfiguration.stringValue(forKey: "EnableActions")?.lowercased()
@@ -58,29 +60,59 @@ final class PaceActionExecutor {
 
     // MARK: - High-level entry point
 
-    /// Executes a sequence of actions parsed from Claude's response.
-    /// Each action waits `interActionDelay` after the previous one so
-    /// the target app can react. When `actionsAreEnabled` is false,
-    /// every call is logged but no system event is posted.
+    /// Executes a serial sequence of actions parsed from legacy inline tags.
+    /// Kept as a compatibility wrapper around the richer tool-plan shape.
+    @discardableResult
     func executeActionSequence(
         _ actions: [PaceParsedAction],
         screenCaptures: [CompanionScreenCapture]
-    ) async {
-        guard !actions.isEmpty else { return }
+    ) async -> [PaceActionExecutionObservation] {
+        await executeActionPlan(
+            PaceActionExecutionPlan.serial(actions: actions),
+            screenCaptures: screenCaptures
+        )
+    }
 
-        for (actionIndex, action) in actions.enumerated() {
-            await executeSingleAction(action, screenCaptures: screenCaptures)
-            let isLastAction = (actionIndex == actions.count - 1)
-            if !isLastAction {
+    /// Executes a tool plan: outer steps are sequential; actions within one
+    /// step are a parallel group at the planner contract level. UI-mutating
+    /// actions still run in source order because macOS focus/cursor state is
+    /// global and not safe to mutate concurrently.
+    @discardableResult
+    func executeActionPlan(
+        _ actionExecutionPlan: PaceActionExecutionPlan,
+        screenCaptures: [CompanionScreenCapture]
+    ) async -> [PaceActionExecutionObservation] {
+        guard !actionExecutionPlan.steps.isEmpty else { return [] }
+
+        var observations: [PaceActionExecutionObservation] = []
+
+        for (stepIndex, step) in actionExecutionPlan.steps.enumerated() {
+            guard !step.actions.isEmpty else { continue }
+
+            for (actionIndex, action) in step.actions.enumerated() {
+                if let observation = await executeSingleAction(action, screenCaptures: screenCaptures) {
+                    observations.append(observation)
+                }
+
+                let isLastActionInStep = (actionIndex == step.actions.count - 1)
+                if !isLastActionInStep {
+                    try? await Task.sleep(nanoseconds: UInt64(interActionDelay * 1_000_000_000))
+                }
+            }
+
+            let isLastStep = (stepIndex == actionExecutionPlan.steps.count - 1)
+            if !isLastStep {
                 try? await Task.sleep(nanoseconds: UInt64(interActionDelay * 1_000_000_000))
             }
         }
+
+        return observations
     }
 
     private func executeSingleAction(
         _ action: PaceParsedAction,
         screenCaptures: [CompanionScreenCapture]
-    ) async {
+    ) async -> PaceActionExecutionObservation? {
         switch action {
         case .click(let location):
             await clickAtScreenshotLocation(location, screenCaptures: screenCaptures, clickCount: 1)
@@ -92,7 +124,23 @@ final class PaceActionExecutor {
             await pressKey(named: keyName, withModifiers: modifiers)
         case .scroll(let direction, let amount):
             await scroll(direction: direction, amountInLines: amount)
+        case .openApplication(let applicationName):
+            await openApplication(named: applicationName)
+        case .openURL(let urlString):
+            return await openURL(urlString)
+        case .controlMusic(let musicCommand):
+            return await controlMusic(musicCommand)
+        case .adjustVolume(let adjustment):
+            await adjustVolume(adjustment)
+        case .adjustBrightness(let adjustment):
+            await adjustBrightness(adjustment)
+        case .listCalendarEvents(let calendarQuery):
+            return await listCalendarEvents(calendarQuery)
+        case .createReminder(let reminderRequest):
+            return await createReminder(reminderRequest)
         }
+
+        return nil
     }
 
     // MARK: - Mouse
@@ -186,6 +234,388 @@ final class PaceActionExecutor {
             scrollEvent.post(tap: .cghidEventTap)
         }
     }
+
+    // MARK: - System tools
+
+    private func openApplication(named applicationName: String) async {
+        let trimmedApplicationName = applicationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedApplicationName.isEmpty else { return }
+
+        print("🧰 Open app \"\(trimmedApplicationName)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else { return }
+
+        guard let applicationURL = Self.findApplicationURL(named: trimmedApplicationName) else {
+            print("⚠️ PaceActionExecutor: could not find app named \(trimmedApplicationName)")
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { _, error in
+                if let error {
+                    print("⚠️ PaceActionExecutor: failed to open \(trimmedApplicationName): \(error.localizedDescription)")
+                }
+                continuation.resume()
+            }
+        }
+    }
+
+    private func openURL(_ rawURLString: String) async -> PaceActionExecutionObservation {
+        let trimmedURLString = rawURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURLString.isEmpty else {
+            return PaceActionExecutionObservation(toolName: "open_url", summary: "No URL was provided.")
+        }
+
+        let normalizedURLString: String = {
+            if trimmedURLString.contains("://") {
+                return trimmedURLString
+            }
+            return "https://\(trimmedURLString)"
+        }()
+
+        guard let url = URL(string: normalizedURLString) else {
+            return PaceActionExecutionObservation(
+                toolName: "open_url",
+                summary: "Could not parse URL: \(trimmedURLString)"
+            )
+        }
+
+        print("🧰 Open URL \"\(url.absoluteString)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "open_url",
+                summary: "Would open URL: \(url.absoluteString)"
+            )
+        }
+
+        let didOpen = NSWorkspace.shared.open(url)
+        return PaceActionExecutionObservation(
+            toolName: "open_url",
+            summary: didOpen ? "Opened URL: \(url.absoluteString)" : "Failed to open URL: \(url.absoluteString)"
+        )
+    }
+
+    private func controlMusic(_ musicCommand: PaceMusicCommand) async -> PaceActionExecutionObservation {
+        print("🧰 Music \(musicCommand.rawValue) (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "music",
+                summary: "Would run Music command: \(musicCommand.rawValue)"
+            )
+        }
+
+        switch musicCommand {
+        case .play, .pause:
+            await openApplication(named: "Music")
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let scriptVerb = (musicCommand == .play) ? "play" : "pause"
+            let scriptResult = runAppleScript(source: """
+            tell application "Music"
+                \(scriptVerb)
+            end tell
+            """)
+            if let errorDescription = scriptResult.errorDescription {
+                return PaceActionExecutionObservation(
+                    toolName: "music",
+                    summary: "Music \(musicCommand.rawValue) failed: \(errorDescription)"
+                )
+            }
+            return PaceActionExecutionObservation(
+                toolName: "music",
+                summary: "Music command completed: \(musicCommand.rawValue)"
+            )
+        case .playPause:
+            postAuxiliaryKeyEvent(keyType: Self.mediaPlayPauseKeyType)
+        case .next:
+            postAuxiliaryKeyEvent(keyType: Self.mediaNextKeyType)
+        case .previous:
+            postAuxiliaryKeyEvent(keyType: Self.mediaPreviousKeyType)
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "music",
+            summary: "Music command completed: \(musicCommand.rawValue)"
+        )
+    }
+
+    private func adjustVolume(_ adjustment: PaceSystemAdjustment) async {
+        print("🧰 Volume \(adjustment) (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else { return }
+
+        for _ in 0..<adjustment.stepCount {
+            switch adjustment.direction {
+            case .up:
+                postAuxiliaryKeyEvent(keyType: Self.soundUpKeyType)
+            case .down:
+                postAuxiliaryKeyEvent(keyType: Self.soundDownKeyType)
+            }
+            try? await Task.sleep(nanoseconds: 55_000_000)
+        }
+    }
+
+    private func adjustBrightness(_ adjustment: PaceSystemAdjustment) async {
+        print("🧰 Brightness \(adjustment) (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else { return }
+
+        for _ in 0..<adjustment.stepCount {
+            switch adjustment.direction {
+            case .up:
+                postAuxiliaryKeyEvent(keyType: Self.brightnessUpKeyType)
+            case .down:
+                postAuxiliaryKeyEvent(keyType: Self.brightnessDownKeyType)
+            }
+            try? await Task.sleep(nanoseconds: 55_000_000)
+        }
+    }
+
+    private func listCalendarEvents(_ calendarQuery: PaceCalendarQuery) async -> PaceActionExecutionObservation {
+        print("🧰 Calendar list \(calendarQuery.range.rawValue) (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "calendar",
+                summary: "Would list calendar events for \(calendarQuery.range.displayName)."
+            )
+        }
+
+        guard await requestCalendarAccessIfNeeded() else {
+            return PaceActionExecutionObservation(
+                toolName: "calendar",
+                summary: "Calendar access was not granted."
+            )
+        }
+
+        let now = Date()
+        let dateInterval = calendarQuery.dateInterval(relativeTo: now)
+        let predicate = eventStore.predicateForEvents(
+            withStart: dateInterval.start,
+            end: dateInterval.end,
+            calendars: nil
+        )
+        let matchingEvents = eventStore.events(matching: predicate)
+            .filter { $0.endDate >= now }
+            .sorted { $0.startDate < $1.startDate }
+            .prefix(12)
+
+        guard !matchingEvents.isEmpty else {
+            return PaceActionExecutionObservation(
+                toolName: "calendar",
+                summary: "No calendar events found for \(calendarQuery.range.displayName)."
+            )
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+
+        let eventSummaries = matchingEvents.map { event in
+            let title = event.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeTitle = title?.isEmpty == false ? title! : "Untitled event"
+            let locationSuffix: String = {
+                guard let location = event.location?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !location.isEmpty else {
+                    return ""
+                }
+                return " at \(location)"
+            }()
+            return "\(formatter.string(from: event.startDate)): \(safeTitle)\(locationSuffix)"
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "calendar",
+            summary: "Calendar events for \(calendarQuery.range.displayName):\n" + eventSummaries.joined(separator: "\n")
+        )
+    }
+
+    private func createReminder(_ reminderRequest: PaceReminderRequest) async -> PaceActionExecutionObservation {
+        print("🧰 Create reminder \"\(reminderRequest.title)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "reminder",
+                summary: "Would create reminder: \(reminderRequest.title)"
+            )
+        }
+
+        guard await requestReminderAccessIfNeeded() else {
+            return PaceActionExecutionObservation(
+                toolName: "reminder",
+                summary: "Reminder access was not granted."
+            )
+        }
+
+        guard let reminderCalendar = eventStore.defaultCalendarForNewReminders() else {
+            return PaceActionExecutionObservation(
+                toolName: "reminder",
+                summary: "Could not find a default reminders list."
+            )
+        }
+
+        let reminder = EKReminder(eventStore: eventStore)
+        reminder.calendar = reminderCalendar
+        reminder.title = reminderRequest.title
+        reminder.notes = reminderRequest.notes
+
+        do {
+            try eventStore.save(reminder, commit: true)
+            return PaceActionExecutionObservation(
+                toolName: "reminder",
+                summary: "Created reminder: \(reminderRequest.title)"
+            )
+        } catch {
+            return PaceActionExecutionObservation(
+                toolName: "reminder",
+                summary: "Failed to create reminder: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func postAuxiliaryKeyEvent(keyType: Int32) {
+        let keyDownData = (keyType << 16) | (0xA << 8)
+        let keyUpData = (keyType << 16) | (0xB << 8)
+
+        for eventData in [keyDownData, keyUpData] {
+            guard let event = NSEvent.otherEvent(
+                with: .systemDefined,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                subtype: 8,
+                data1: Int(eventData),
+                data2: -1
+            )?.cgEvent else {
+                continue
+            }
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func requestCalendarAccessIfNeeded() async -> Bool {
+        await withCheckedContinuation { continuation in
+            if #available(macOS 14.0, *) {
+                eventStore.requestFullAccessToEvents { granted, error in
+                    if let error {
+                        print("⚠️ PaceActionExecutor: calendar access error: \(error.localizedDescription)")
+                    }
+                    continuation.resume(returning: granted)
+                }
+            } else {
+                eventStore.requestAccess(to: .event) { granted, error in
+                    if let error {
+                        print("⚠️ PaceActionExecutor: calendar access error: \(error.localizedDescription)")
+                    }
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+    }
+
+    private func requestReminderAccessIfNeeded() async -> Bool {
+        await withCheckedContinuation { continuation in
+            if #available(macOS 14.0, *) {
+                eventStore.requestFullAccessToReminders { granted, error in
+                    if let error {
+                        print("⚠️ PaceActionExecutor: reminders access error: \(error.localizedDescription)")
+                    }
+                    continuation.resume(returning: granted)
+                }
+            } else {
+                eventStore.requestAccess(to: .reminder) { granted, error in
+                    if let error {
+                        print("⚠️ PaceActionExecutor: reminders access error: \(error.localizedDescription)")
+                    }
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+    }
+
+    private func runAppleScript(source: String) -> (output: String?, errorDescription: String?) {
+        guard let script = NSAppleScript(source: source) else {
+            return (nil, "Could not compile AppleScript.")
+        }
+
+        var errorInfo: NSDictionary?
+        let resultDescriptor = script.executeAndReturnError(&errorInfo)
+        if let errorInfo {
+            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "\(errorInfo)"
+            return (nil, message)
+        }
+
+        return (resultDescriptor.stringValue, nil)
+    }
+
+    private static func findApplicationURL(named applicationName: String) -> URL? {
+        let trimmedApplicationName = applicationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedApplicationName.isEmpty else { return nil }
+
+        if trimmedApplicationName.contains("."),
+           let bundleURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: trimmedApplicationName) {
+            return bundleURL
+        }
+
+        let requestedAppName = trimmedApplicationName.hasSuffix(".app")
+            ? String(trimmedApplicationName.dropLast(4))
+            : trimmedApplicationName
+        let normalizedRequestedName = normalizeApplicationName(requestedAppName)
+
+        let searchRoots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications", isDirectory: true)
+        ]
+
+        for searchRoot in searchRoots {
+            guard let appURL = findApplicationURL(
+                matchingNormalizedName: normalizedRequestedName,
+                under: searchRoot
+            ) else {
+                continue
+            }
+            return appURL
+        }
+
+        return nil
+    }
+
+    private static func findApplicationURL(
+        matchingNormalizedName normalizedRequestedName: String,
+        under searchRoot: URL
+    ) -> URL? {
+        let resourceKeys: [URLResourceKey] = [.isDirectoryKey, .isApplicationKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: searchRoot,
+            includingPropertiesForKeys: resourceKeys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return nil
+        }
+
+        for case let candidateURL as URL in enumerator {
+            guard candidateURL.pathExtension.lowercased() == "app" else { continue }
+            let candidateName = candidateURL.deletingPathExtension().lastPathComponent
+            if normalizeApplicationName(candidateName) == normalizedRequestedName {
+                return candidateURL
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizeApplicationName(_ applicationName: String) -> String {
+        applicationName
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static let soundUpKeyType: Int32 = 0
+    private static let soundDownKeyType: Int32 = 1
+    private static let brightnessUpKeyType: Int32 = 2
+    private static let brightnessDownKeyType: Int32 = 3
+    private static let mediaPlayPauseKeyType: Int32 = 16
+    private static let mediaNextKeyType: Int32 = 17
+    private static let mediaPreviousKeyType: Int32 = 18
 
     // MARK: - Keyboard
 
@@ -322,6 +752,38 @@ final class PaceActionExecutor {
 
 // MARK: - Parsed action types
 
+struct PaceActionExecutionObservation {
+    let toolName: String
+    let summary: String
+
+    static func formatForPlanner(_ observations: [PaceActionExecutionObservation]) -> String {
+        observations
+            .enumerated()
+            .map { index, observation in
+                "[\(index + 1)] \(observation.toolName): \(observation.summary)"
+            }
+            .joined(separator: "\n")
+    }
+}
+
+struct PaceActionExecutionPlan {
+    let steps: [PaceActionExecutionStep]
+
+    static func serial(actions: [PaceParsedAction]) -> PaceActionExecutionPlan {
+        PaceActionExecutionPlan(
+            steps: actions.map { PaceActionExecutionStep(actions: [$0]) }
+        )
+    }
+
+    var flattenedActions: [PaceParsedAction] {
+        steps.flatMap(\.actions)
+    }
+}
+
+struct PaceActionExecutionStep {
+    let actions: [PaceParsedAction]
+}
+
 /// One action Claude wants pace to perform on the user's behalf.
 /// Parsed out of the assistant's response by `PaceActionTagParser`.
 enum PaceParsedAction {
@@ -330,6 +792,13 @@ enum PaceParsedAction {
     case type(String)
     case pressKey(name: String, modifiers: [PaceKeyboardModifier])
     case scroll(PaceScrollDirection, amountInLines: Int)
+    case openApplication(String)
+    case openURL(String)
+    case controlMusic(PaceMusicCommand)
+    case adjustVolume(PaceSystemAdjustment)
+    case adjustBrightness(PaceSystemAdjustment)
+    case listCalendarEvents(PaceCalendarQuery)
+    case createReminder(PaceReminderRequest)
 }
 
 enum PaceKeyboardModifier: String {
@@ -342,6 +811,68 @@ enum PaceScrollDirection: String, CustomStringConvertible {
     var description: String { rawValue }
 }
 
+struct PaceSystemAdjustment: CustomStringConvertible {
+    let direction: PaceAdjustmentDirection
+    let stepCount: Int
+
+    var description: String {
+        "\(direction.rawValue):\(stepCount)"
+    }
+}
+
+enum PaceAdjustmentDirection: String {
+    case up, down
+}
+
+enum PaceMusicCommand: String, Equatable {
+    case play
+    case pause
+    case playPause
+    case next
+    case previous
+}
+
+struct PaceCalendarQuery {
+    let range: PaceCalendarRange
+
+    func dateInterval(relativeTo date: Date) -> DateInterval {
+        let calendar = Calendar.current
+        switch range {
+        case .today:
+            let startOfToday = calendar.startOfDay(for: date)
+            let endOfToday = calendar.date(byAdding: .day, value: 1, to: startOfToday) ?? date
+            return DateInterval(start: startOfToday, end: endOfToday)
+        case .tomorrow:
+            let startOfToday = calendar.startOfDay(for: date)
+            let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday) ?? date
+            let endOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfTomorrow) ?? startOfTomorrow
+            return DateInterval(start: startOfTomorrow, end: endOfTomorrow)
+        case .week:
+            let endOfRange = calendar.date(byAdding: .day, value: 7, to: date) ?? date
+            return DateInterval(start: date, end: endOfRange)
+        }
+    }
+}
+
+enum PaceCalendarRange: String, Equatable {
+    case today
+    case tomorrow
+    case week
+
+    var displayName: String {
+        switch self {
+        case .today: return "today"
+        case .tomorrow: return "tomorrow"
+        case .week: return "the next 7 days"
+        }
+    }
+}
+
+struct PaceReminderRequest {
+    let title: String
+    let notes: String?
+}
+
 // MARK: - Action tag parser
 
 /// Result of pulling all action tags out of Claude's response.
@@ -351,6 +882,9 @@ struct PaceActionTagParseResult {
     let spokenText: String
     /// The parsed actions, in the order they appeared in the response.
     let actions: [PaceParsedAction]
+    /// Grouped tool-call plan. Outer steps run sequentially; actions
+    /// within one step are the model's requested parallel group.
+    let executionPlan: PaceActionExecutionPlan
     /// The first click/double-click coordinate, if any — used by the
     /// existing cursor-flight visualization so the user sees pace
     /// move to the target before it executes.
@@ -358,64 +892,133 @@ struct PaceActionTagParseResult {
 }
 
 enum PaceActionTagParser {
+    private struct ToolCallDTO: Decodable {
+        let tool: String
+        let app: String?
+        let name: String?
+        let url: String?
+        let command: String?
+        let direction: String?
+        let title: String?
+        let text: String?
+        let notes: String?
+        let range: String?
+        let key: String?
+        let steps: Int?
+        let amount: Int?
+        let x: Int?
+        let y: Int?
+        let screen: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case tool, app, name, url, command, direction, title, text, notes, range, key, steps, amount, x, y, screen
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.tool = try container.decode(String.self, forKey: .tool)
+            self.app = Self.decodeStringIfPresent(from: container, forKey: .app)
+            self.name = Self.decodeStringIfPresent(from: container, forKey: .name)
+            self.url = Self.decodeStringIfPresent(from: container, forKey: .url)
+            self.command = Self.decodeStringIfPresent(from: container, forKey: .command)
+            self.direction = Self.decodeStringIfPresent(from: container, forKey: .direction)
+            self.title = Self.decodeStringIfPresent(from: container, forKey: .title)
+            self.text = Self.decodeStringIfPresent(from: container, forKey: .text)
+            self.notes = Self.decodeStringIfPresent(from: container, forKey: .notes)
+            self.range = Self.decodeStringIfPresent(from: container, forKey: .range)
+            self.key = Self.decodeStringIfPresent(from: container, forKey: .key)
+            self.steps = Self.decodeIntIfPresent(from: container, forKey: .steps)
+            self.amount = Self.decodeIntIfPresent(from: container, forKey: .amount)
+            self.x = Self.decodeIntIfPresent(from: container, forKey: .x)
+            self.y = Self.decodeIntIfPresent(from: container, forKey: .y)
+            self.screen = Self.decodeIntIfPresent(from: container, forKey: .screen)
+        }
+
+        private static func decodeStringIfPresent(
+            from container: KeyedDecodingContainer<CodingKeys>,
+            forKey key: CodingKeys
+        ) -> String? {
+            if let stringValue = try? container.decodeIfPresent(String.self, forKey: key) {
+                return stringValue
+            }
+            if let intValue = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return String(intValue)
+            }
+            return nil
+        }
+
+        private static func decodeIntIfPresent(
+            from container: KeyedDecodingContainer<CodingKeys>,
+            forKey key: CodingKeys
+        ) -> Int? {
+            if let intValue = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return intValue
+            }
+            if let stringValue = try? container.decodeIfPresent(String.self, forKey: key) {
+                return Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            return nil
+        }
+    }
+
     /// Tag formats supported (case-insensitive on tag name):
     ///   [CLICK:x,y]                or [CLICK:x,y:screen2]
     ///   [DOUBLE_CLICK:x,y]         or [DOUBLE_CLICK:x,y:screen2]
     ///   [TYPE:hello world]
     ///   [KEY:Return]               or [KEY:cmd+s]   or [KEY:cmd+shift+t]
     ///   [SCROLL:up:3]              or [SCROLL:down:5]
+    ///   [OPEN_APP:Safari]
+    ///   [VOLUME:up:2]              or [VOLUME:down]
+    ///   [BRIGHTNESS:up]            or [BRIGHTNESS:down:3]
+    ///
+    /// Preferred grouped format:
+    ///   <tool_calls>
+    ///   [[{"tool":"open_app","app":"Music"},{"tool":"music","command":"play"}]]
+    ///   </tool_calls>
     ///
     /// Order of tags in the response is preserved in the returned actions array.
     static func parseActions(from responseText: String) -> PaceActionTagParseResult {
+        let (toolCallSteps, responseTextWithoutToolCallBlocks) = parseToolCallBlocks(in: responseText)
+
         // One regex that matches any of the supported tag shapes. We use a
         // single pass so we can walk matches in source order. Group 1 is the
         // tag name; group 2 is the everything-after-the-colon payload.
-        let actionTagPattern = #"\[(CLICK|DOUBLE_CLICK|TYPE|KEY|SCROLL):([^\]]+)\]"#
+        let actionTagPattern = #"\[(CLICK|DOUBLE_CLICK|TYPE|KEY|SCROLL|OPEN_APP|OPEN_URL|MUSIC|VOLUME|BRIGHTNESS|CALENDAR|REMINDER):([^\]]+)\]"#
 
         guard let actionTagRegex = try? NSRegularExpression(
             pattern: actionTagPattern,
             options: [.caseInsensitive]
         ) else {
+            let allActions = toolCallSteps.flatMap(\.actions)
             return PaceActionTagParseResult(
-                spokenText: responseText,
-                actions: [],
-                firstClickVisualisationLocation: nil
+                spokenText: responseTextWithoutToolCallBlocks,
+                actions: allActions,
+                executionPlan: PaceActionExecutionPlan(steps: toolCallSteps),
+                firstClickVisualisationLocation: firstClickVisualisationLocation(in: allActions)
             )
         }
 
-        let entireRange = NSRange(responseText.startIndex..., in: responseText)
-        let matches = actionTagRegex.matches(in: responseText, options: [], range: entireRange)
+        let entireRange = NSRange(responseTextWithoutToolCallBlocks.startIndex..., in: responseTextWithoutToolCallBlocks)
+        let matches = actionTagRegex.matches(in: responseTextWithoutToolCallBlocks, options: [], range: entireRange)
 
         var parsedActions: [PaceParsedAction] = []
-        var firstClickVisualisationLocation: ScreenshotPixelLocation? = nil
-        var spokenTextWithoutActionTags = responseText
+        var spokenTextWithoutActionTags = responseTextWithoutToolCallBlocks
 
         // Build spoken text by removing matches in reverse so ranges stay valid.
         let matchesInForwardOrder = matches
         let matchesInReverseOrder = matches.reversed()
 
         for match in matchesInForwardOrder {
-            guard let fullRange = Range(match.range, in: responseText),
-                  let nameRange = Range(match.range(at: 1), in: responseText),
-                  let payloadRange = Range(match.range(at: 2), in: responseText) else {
+            guard let fullRange = Range(match.range, in: responseTextWithoutToolCallBlocks),
+                  let nameRange = Range(match.range(at: 1), in: responseTextWithoutToolCallBlocks),
+                  let payloadRange = Range(match.range(at: 2), in: responseTextWithoutToolCallBlocks) else {
                 continue
             }
-            let tagName = String(responseText[nameRange]).uppercased()
-            let payload = String(responseText[payloadRange])
+            let tagName = String(responseTextWithoutToolCallBlocks[nameRange]).uppercased()
+            let payload = String(responseTextWithoutToolCallBlocks[payloadRange])
 
             if let parsedAction = parseSingleAction(tagName: tagName, payload: payload) {
                 parsedActions.append(parsedAction)
-
-                // Record the first CLICK / DOUBLE_CLICK location so the
-                // cursor flight animation has somewhere to fly to.
-                if firstClickVisualisationLocation == nil {
-                    switch parsedAction {
-                    case .click(let loc), .doubleClick(let loc):
-                        firstClickVisualisationLocation = loc
-                    default:
-                        break
-                    }
-                }
             }
             _ = fullRange // silence unused warning; we use it via the reverse loop below
         }
@@ -428,10 +1031,14 @@ enum PaceActionTagParser {
         let cleanedSpokenText = spokenTextWithoutActionTags
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
+        let executionSteps = toolCallSteps + parsedActions.map { PaceActionExecutionStep(actions: [$0]) }
+        let allActions = executionSteps.flatMap(\.actions)
+
         return PaceActionTagParseResult(
             spokenText: cleanedSpokenText,
-            actions: parsedActions,
-            firstClickVisualisationLocation: firstClickVisualisationLocation
+            actions: allActions,
+            executionPlan: PaceActionExecutionPlan(steps: executionSteps),
+            firstClickVisualisationLocation: firstClickVisualisationLocation(in: allActions)
         )
     }
 
@@ -448,9 +1055,153 @@ enum PaceActionTagParser {
             return parseKeyPayload(payload)
         case "SCROLL":
             return parseScrollPayload(payload)
+        case "OPEN_APP":
+            return parseOpenApplicationPayload(payload)
+        case "OPEN_URL":
+            return parseOpenURLPayload(payload)
+        case "MUSIC":
+            return parseMusicPayload(payload)
+        case "VOLUME":
+            return parseSystemAdjustmentPayload(payload).map { .adjustVolume($0) }
+        case "BRIGHTNESS":
+            return parseSystemAdjustmentPayload(payload).map { .adjustBrightness($0) }
+        case "CALENDAR":
+            return parseCalendarPayload(payload)
+        case "REMINDER":
+            return parseReminderPayload(payload)
         default:
             return nil
         }
+    }
+
+    private static func parseToolCallBlocks(in responseText: String) -> (steps: [PaceActionExecutionStep], strippedText: String) {
+        let pattern = #"<tool_calls>(.*?)</tool_calls>"#
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else {
+            return ([], responseText)
+        }
+
+        let entireRange = NSRange(responseText.startIndex..., in: responseText)
+        let matches = regex.matches(in: responseText, options: [], range: entireRange)
+        guard !matches.isEmpty else { return ([], responseText) }
+
+        var parsedSteps: [PaceActionExecutionStep] = []
+        var strippedText = responseText
+
+        for match in matches {
+            guard let jsonRange = Range(match.range(at: 1), in: responseText) else { continue }
+            let jsonText = String(responseText[jsonRange])
+            parsedSteps.append(contentsOf: decodeToolCallSteps(from: jsonText))
+        }
+
+        for match in matches.reversed() {
+            guard let fullRange = Range(match.range, in: strippedText) else { continue }
+            strippedText.removeSubrange(fullRange)
+        }
+
+        return (parsedSteps, strippedText)
+    }
+
+    private static func decodeToolCallSteps(from jsonText: String) -> [PaceActionExecutionStep] {
+        guard let jsonData = jsonText.data(using: .utf8) else { return [] }
+        let decoder = JSONDecoder()
+
+        if let groupedToolCalls = try? decoder.decode([[ToolCallDTO]].self, from: jsonData) {
+            return groupedToolCalls.compactMap { toolCallGroup in
+                let actions = toolCallGroup.compactMap(parseToolCall)
+                return actions.isEmpty ? nil : PaceActionExecutionStep(actions: actions)
+            }
+        }
+
+        if let flatToolCalls = try? decoder.decode([ToolCallDTO].self, from: jsonData) {
+            return flatToolCalls.compactMap { toolCall in
+                guard let action = parseToolCall(toolCall) else { return nil }
+                return PaceActionExecutionStep(actions: [action])
+            }
+        }
+
+        return []
+    }
+
+    private static func parseToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let normalizedToolName = toolCall.tool
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+
+        switch normalizedToolName {
+        case "click":
+            return parseToolCallLocation(toolCall).map { .click($0) }
+        case "double_click", "doubleclick":
+            return parseToolCallLocation(toolCall).map { .doubleClick($0) }
+        case "type":
+            guard let text = toolCall.text, !text.isEmpty else { return nil }
+            return .type(text)
+        case "key", "press_key":
+            return parseKeyPayload(toolCall.key ?? toolCall.command ?? "")
+        case "scroll":
+            return parseScrollPayload(
+                [
+                    toolCall.direction,
+                    (toolCall.amount ?? toolCall.steps).map(String.init)
+                ]
+                .compactMap { $0 }
+                .joined(separator: ":")
+            )
+        case "open_app", "open_application":
+            return parseOpenApplicationPayload(toolCall.app ?? toolCall.name ?? "")
+        case "open_url", "open_website", "website":
+            return parseOpenURLPayload(toolCall.url ?? toolCall.text ?? "")
+        case "music":
+            return parseMusicPayload(toolCall.command ?? "")
+        case "volume":
+            return parseSystemAdjustmentPayload(
+                [
+                    toolCall.direction,
+                    toolCall.steps.map(String.init)
+                ]
+                .compactMap { $0 }
+                .joined(separator: ":")
+            ).map { .adjustVolume($0) }
+        case "brightness":
+            return parseSystemAdjustmentPayload(
+                [
+                    toolCall.direction,
+                    toolCall.steps.map(String.init)
+                ]
+                .compactMap { $0 }
+                .joined(separator: ":")
+            ).map { .adjustBrightness($0) }
+        case "calendar", "calendar_events", "list_calendar":
+            return parseCalendarPayload(toolCall.range ?? "today")
+        case "reminder", "create_reminder":
+            return parseReminderPayload(toolCall.title ?? toolCall.text ?? "")
+        default:
+            return nil
+        }
+    }
+
+    private static func parseToolCallLocation(_ toolCall: ToolCallDTO) -> ScreenshotPixelLocation? {
+        guard let xPixel = toolCall.x, let yPixel = toolCall.y else { return nil }
+        return ScreenshotPixelLocation(
+            xInScreenshotPixels: xPixel,
+            yInScreenshotPixels: yPixel,
+            screenNumber: toolCall.screen
+        )
+    }
+
+    private static func firstClickVisualisationLocation(in actions: [PaceParsedAction]) -> ScreenshotPixelLocation? {
+        for action in actions {
+            switch action {
+            case .click(let location), .doubleClick(let location):
+                return location
+            default:
+                continue
+            }
+        }
+        return nil
     }
 
     /// Parses `x,y` or `x,y:screenN` into a ScreenshotPixelLocation.
@@ -519,5 +1270,81 @@ enum PaceActionTagParser {
         }()
 
         return .scroll(direction, amountInLines: amountInLines)
+    }
+
+    private static func parseOpenApplicationPayload(_ payload: String) -> PaceParsedAction? {
+        let applicationName = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !applicationName.isEmpty else { return nil }
+        return .openApplication(applicationName)
+    }
+
+    private static func parseOpenURLPayload(_ payload: String) -> PaceParsedAction? {
+        let urlString = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !urlString.isEmpty else { return nil }
+        return .openURL(urlString)
+    }
+
+    private static func parseMusicPayload(_ payload: String) -> PaceParsedAction? {
+        let normalizedCommand = payload
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch normalizedCommand {
+        case "play":
+            return .controlMusic(.play)
+        case "pause":
+            return .controlMusic(.pause)
+        case "play_pause", "playpause", "toggle":
+            return .controlMusic(.playPause)
+        case "next", "next_track":
+            return .controlMusic(.next)
+        case "previous", "prev", "previous_track":
+            return .controlMusic(.previous)
+        default:
+            return nil
+        }
+    }
+
+    private static func parseCalendarPayload(_ payload: String) -> PaceParsedAction? {
+        let normalizedRange = payload
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let range: PaceCalendarRange
+        switch normalizedRange {
+        case "today", "":
+            range = .today
+        case "tomorrow":
+            range = .tomorrow
+        case "week", "next_week", "next_7_days", "next 7 days":
+            range = .week
+        default:
+            return nil
+        }
+        return .listCalendarEvents(PaceCalendarQuery(range: range))
+    }
+
+    private static func parseReminderPayload(_ payload: String) -> PaceParsedAction? {
+        let reminderTitle = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reminderTitle.isEmpty else { return nil }
+        return .createReminder(PaceReminderRequest(title: reminderTitle, notes: nil))
+    }
+
+    /// Parses `up`, `down`, `up:3`, `down:5` into a relative system adjustment.
+    private static func parseSystemAdjustmentPayload(_ payload: String) -> PaceSystemAdjustment? {
+        let payloadComponents = payload.split(separator: ":", omittingEmptySubsequences: true)
+        guard let directionString = payloadComponents.first,
+              let direction = PaceAdjustmentDirection(rawValue: directionString.trimmingCharacters(in: .whitespaces).lowercased()) else {
+            return nil
+        }
+
+        let stepCount: Int = {
+            if payloadComponents.count >= 2,
+               let parsedStepCount = Int(payloadComponents[1].trimmingCharacters(in: .whitespaces)) {
+                return max(1, min(parsedStepCount, 10))
+            }
+            return 2
+        }()
+
+        return PaceSystemAdjustment(direction: direction, stepCount: stepCount)
     }
 }

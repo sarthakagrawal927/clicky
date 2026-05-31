@@ -81,9 +81,9 @@ enum BuddyNavigationMode {
 // SwiftUI view for the blue glowing cursor pointer.
 // Each screen gets its own BlueCursorView. The view checks whether
 // the cursor is currently on THIS screen and only shows the buddy
-// triangle when it is. During voice interaction, the triangle is
-// replaced by a waveform (listening), spinner (processing), or
-// streaming text bubble (responding).
+// triangle when it is. Voice-state animation now lives in the
+// menu-bar/notch surface; this overlay is kept for cursor flight,
+// pointing, and response placement.
 struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
@@ -185,7 +185,10 @@ struct BlueCursorView: View {
             Color.black.opacity(0.001)
 
             // Welcome speech bubble (first launch only)
-            if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
+            if companionManager.areCursorAnnotationsEnabled
+                && isCursorOnThisScreen
+                && showWelcome
+                && !welcomeText.isEmpty {
                 Text(welcomeText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white)
@@ -215,7 +218,9 @@ struct BlueCursorView: View {
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.
-            if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
+            if companionManager.areCursorAnnotationsEnabled
+                && buddyNavigationMode == .pointingAtTarget
+                && !navigationBubbleText.isEmpty {
                 Text(navigationBubbleText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white)
@@ -248,10 +253,10 @@ struct BlueCursorView: View {
                     }
             }
 
-            // Blue triangle cursor — shown when idle or while TTS is playing (responding).
-            // All three states (triangle, waveform, spinner) stay in the view tree
-            // permanently and cross-fade via opacity so SwiftUI doesn't remove/re-insert
-            // them (which caused a visible cursor "pop").
+            // Blue triangle cursor — shown only while Pace is flying/pointing
+            // at a detected screen element. All voice-state animation lives in
+            // the notch bar so the conversation never animates beside the
+            // mouse cursor.
             //
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
@@ -294,25 +299,10 @@ struct BlueCursorView: View {
                         : nil,
                     value: cursorPosition
                 )
-                .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
                 .animation(
                     buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
                     value: triangleRotationDegrees
                 )
-
-            // Whisper Flow-style voice input pill — replaces the cursor while listening
-            WhisperFlowVoicePillView(audioPowerLevel: companionManager.currentAudioPowerLevel)
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
-                .position(cursorPosition)
-                .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
-                .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
-
-            // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
-            BlueCursorSpinnerView()
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
-                .position(cursorPosition)
-                .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
-                .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
@@ -390,14 +380,13 @@ struct BlueCursorView: View {
     // MARK: - Cursor Tracking
 
     /// Whether the arrow cursor should be rendered right now. Hidden when
-    /// nothing's happening (no voice activity, no flight) so it doesn't
-    /// hover idly next to the avatar. Visible during AI response playback
-    /// or any flight/pointing state — i.e., only when the user expects to
-    /// see the cursor doing something.
+    /// nothing's happening so it doesn't hover idly next to the avatar.
+    /// Voice-state activity is represented only in the notch bar. The cursor
+    /// appears for explicit pointing/navigation, where the user asked Pace to
+    /// indicate an on-screen target.
     private var arrowShouldBeVisible: Bool {
         guard buddyIsVisibleOnThisScreen else { return false }
-        if buddyNavigationMode != .followingCursor { return true }
-        return companionManager.voiceState == .responding
+        return buddyNavigationMode != .followingCursor
     }
 
     private func startTrackingCursor() {

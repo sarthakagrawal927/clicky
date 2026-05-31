@@ -30,10 +30,8 @@ struct leanring_buddyApp: App {
 @MainActor
 final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarPanelManager: MenuBarPanelManager?
+    private var menuBarOverlayManager: PaceMenuBarOverlayManager?
     private let companionManager = CompanionManager()
-    private let avatarOverlayManager = PaceAvatarOverlayManager()
-    private var avatarVisibilityCancellable: AnyCancellable?
-    private var avatarTapNotificationObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("🎯 Pace: Starting...")
@@ -58,46 +56,26 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // unload happens in `applicationWillTerminate`.
         PaceLMStudioModelLoader.warmUpConfiguredModelsAsync()
 
-        menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
+        let menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
+        self.menuBarPanelManager = menuBarPanelManager
+        menuBarOverlayManager = PaceMenuBarOverlayManager(
+            companionManager: companionManager,
+            onTap: { [weak self] anchorFrame in
+                self?.menuBarPanelManager?.togglePanel(anchoredTo: anchorFrame)
+            }
+        )
+        menuBarOverlayManager?.show()
         companionManager.start()
         // Auto-open the panel if the user still needs to do something:
         // either they haven't onboarded yet, or permissions were revoked.
         if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
-            menuBarPanelManager?.showPanelOnLaunch()
+            menuBarPanelManager.showPanelOnLaunch()
         }
         registerAsLoginItemIfNeeded()
-
-        avatarOverlayManager.attach(to: companionManager)
-        // CompanionManager needs a weak handle to ask for the avatar's
-        // current screen position when anchoring the response bubble.
-        companionManager.avatarOverlayManager = avatarOverlayManager
-        avatarVisibilityCancellable = companionManager.$isWalkingAvatarEnabled.sink { [weak self] isVisible in
-            if isVisible {
-                self?.avatarOverlayManager.show()
-            } else {
-                self?.avatarOverlayManager.hide()
-            }
-        }
-        // Clicking the avatar starts / stops a voice turn — the same
-        // pipeline as the keyboard push-to-talk shortcut. Routed through
-        // CompanionManager so all the dictation/overlay/state plumbing
-        // stays in one place.
-        avatarTapNotificationObserver = NotificationCenter.default.addObserver(
-            forName: .paceAvatarTapped,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.companionManager.handleAvatarTapped()
-            }
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let avatarTapNotificationObserver {
-            NotificationCenter.default.removeObserver(avatarTapNotificationObserver)
-        }
-        avatarOverlayManager.hide()
+        menuBarOverlayManager?.hide()
         companionManager.stop()
         // Stop the keepalive heartbeat so it doesn't race with the
         // unload below and immediately re-trigger a load.

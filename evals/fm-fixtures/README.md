@@ -35,9 +35,10 @@ fixture to count as passing.
 ## Action-chain fixtures (FREE_TEXT_MODE)
 
 The typed @Generable schema only covers spokenText + pointAt + click.
-Pace's production `LocalPlannerClient` ALSO emits inline action tags
-(`[CLICK:x,y]`, `[TYPE:exact text]`, `[KEY:cmd+s]`, `[SCROLL:down:3]`)
-as free text, which `PaceActionTagParser` later extracts. To eval
+Pace's production `LocalPlannerClient` ALSO emits `<tool_calls>` JSON blocks
+or legacy inline action tags (`[CLICK:x,y]`, `[TYPE:exact text]`, `[KEY:cmd+s]`,
+`[SCROLL:down:3]`, `[OPEN_APP:Safari]`, `[VOLUME:up:2]`, `[BRIGHTNESS:down:3]`) as free text,
+which `PaceActionTagParser` later extracts. To eval
 these end-to-end, add `FREE_TEXT_MODE: true` to the fixture.
 
 When set, the eval skips `response_format` so the planner's raw

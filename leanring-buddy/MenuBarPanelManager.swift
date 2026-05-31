@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 extension Notification.Name {
@@ -27,11 +28,15 @@ private class KeyablePanel: NSPanel {
 @MainActor
 final class MenuBarPanelManager: NSObject {
     private var statusItem: NSStatusItem?
+    private var statusItemStateCancellable: AnyCancellable?
     private var panel: NSPanel?
+    private var panelAnchorFrameOverride: NSRect?
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
 
     private let companionManager: CompanionManager
+    private let statusItemWidth: CGFloat = 24
+    private let statusItemHeight: CGFloat = 24
     private let panelWidth: CGFloat = 320
     private let panelHeight: CGFloat = 380
 
@@ -45,7 +50,10 @@ final class MenuBarPanelManager: NSObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.hidePanel()
+            guard let manager = self else { return }
+            Task { @MainActor in
+                manager.hidePanel()
+            }
         }
     }
 
@@ -61,50 +69,21 @@ final class MenuBarPanelManager: NSObject {
     // MARK: - Status Item
 
     private func createStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
+        statusItem?.isVisible = true
 
         guard let button = statusItem?.button else { return }
 
-        button.image = makePaceMenuBarIcon()
-        button.image?.isTemplate = true
+        configureStatusButtonAppearance(button)
         button.action = #selector(statusItemClicked)
         button.target = self
-    }
 
-    /// Draws the pace triangle as a menu bar icon. Uses the same shape
-    /// and rotation as the in-app cursor so the menu bar icon matches.
-    private func makePaceMenuBarIcon() -> NSImage {
-        let iconSize: CGFloat = 18
-        let image = NSImage(size: NSSize(width: iconSize, height: iconSize))
-        image.lockFocus()
-
-        let triangleSize = iconSize * 0.7
-        let cx = iconSize * 0.50
-        let cy = iconSize * 0.50
-        let height = triangleSize * sqrt(3.0) / 2.0
-
-        let top = CGPoint(x: cx, y: cy + height / 1.5)
-        let bottomLeft = CGPoint(x: cx - triangleSize / 2, y: cy - height / 3)
-        let bottomRight = CGPoint(x: cx + triangleSize / 2, y: cy - height / 3)
-
-        let angle = 35.0 * .pi / 180.0
-        func rotate(_ point: CGPoint) -> CGPoint {
-            let dx = point.x - cx, dy = point.y - cy
-            let cosA = CGFloat(cos(angle)), sinA = CGFloat(sin(angle))
-            return CGPoint(x: cx + cosA * dx - sinA * dy, y: cy + sinA * dx + cosA * dy)
-        }
-
-        let path = NSBezierPath()
-        path.move(to: rotate(top))
-        path.line(to: rotate(bottomLeft))
-        path.line(to: rotate(bottomRight))
-        path.close()
-
-        NSColor.black.setFill()
-        path.fill()
-
-        image.unlockFocus()
-        return image
+        statusItemStateCancellable = companionManager.objectWillChange
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    self?.refreshStatusItemImage()
+                }
+            }
     }
 
     /// Opens the panel automatically on app launch so the user sees
@@ -117,11 +96,87 @@ final class MenuBarPanelManager: NSObject {
     }
 
     @objc private func statusItemClicked() {
+        togglePanel()
+    }
+
+    private func refreshStatusItemImage() {
+        guard let button = statusItem?.button else { return }
+        configureStatusButtonAppearance(button)
+    }
+
+    private func configureStatusButtonAppearance(_ button: NSStatusBarButton) {
+        button.image = nil
+        button.imagePosition = .noImage
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.96).cgColor
+        button.layer?.cornerRadius = statusItemHeight / 2
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        button.attributedTitle = makeStatusItemAttributedTitle()
+        button.toolTip = statusText
+    }
+
+    private func makeStatusItemAttributedTitle() -> NSAttributedString {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+
+        let attributedTitle = NSMutableAttributedString(
+            string: "Pace  \(statusText)",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraphStyle
+            ]
+        )
+
+        attributedTitle.addAttributes(
+            [
+                .foregroundColor: connectionColor,
+                .font: NSFont.systemFont(ofSize: 11, weight: .bold)
+            ],
+            range: NSRange(location: 0, length: 4)
+        )
+
+        return attributedTitle
+    }
+
+    private var statusText: String {
+        guard companionManager.allPermissionsGranted else {
+            return "Setup"
+        }
+        switch companionManager.voiceState {
+        case .idle:
+            return companionManager.isLMStudioReachable ? "Pace" : "Local offline"
+        case .listening:
+            return "Listening"
+        case .processing:
+            return "Thinking"
+        case .responding:
+            return "Speaking"
+        }
+    }
+
+    private var connectionColor: NSColor {
+        if !companionManager.allPermissionsGranted {
+            return .systemOrange
+        }
+        return companionManager.isLMStudioReachable
+            ? .systemGreen
+            : NSColor.white.withAlphaComponent(0.40)
+    }
+
+    func togglePanel() {
         if let panel, panel.isVisible {
             hidePanel()
         } else {
             showPanel()
         }
+    }
+
+    func togglePanel(anchoredTo anchorFrame: NSRect) {
+        panelAnchorFrameOverride = anchorFrame
+        togglePanel()
     }
 
     // MARK: - Panel Lifecycle
@@ -177,9 +232,14 @@ final class MenuBarPanelManager: NSObject {
 
     private func positionPanelBelowStatusItem() {
         guard let panel else { return }
-        guard let buttonWindow = statusItem?.button?.window else { return }
-
-        let statusItemFrame = buttonWindow.frame
+        let statusItemFrame: NSRect
+        if let panelAnchorFrameOverride {
+            statusItemFrame = panelAnchorFrameOverride
+        } else if let buttonWindow = statusItem?.button?.window {
+            statusItemFrame = buttonWindow.frame
+        } else {
+            return
+        }
         let gapBelowMenuBar: CGFloat = 4
 
         // Calculate the panel's content height from the hosting view's fitting size

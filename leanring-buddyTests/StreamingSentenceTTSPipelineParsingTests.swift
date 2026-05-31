@@ -110,11 +110,31 @@ struct StreamingSentenceTTSPipelineParsingTests {
 
     @Test func completedActionTagsAreStrippedFromSpeakablePrefix() async throws {
         let result = StreamingSentenceTTSPipeline.testablyComputeSpeakableSafePrefix(
-            from: "saving now [KEY:cmd+s] [DONE]. done."
+            from: "opening safari [OPEN_APP:Safari] and turning it down [VOLUME:down:2] [DONE]. done."
         )
-        // Both [KEY:…] and [DONE] strip out; the trailing "done."
+        // Action tags and [DONE] strip out; the trailing "done."
         // sentence remains the speakable boundary.
-        #expect(result == "saving now  . done.")
+        #expect(result == "opening safari  and turning it down  . done.")
+    }
+
+    @Test func completedToolCallBlockIsStrippedFromSpeakablePrefix() async throws {
+        let result = StreamingSentenceTTSPipeline.testablyComputeSpeakableSafePrefix(
+            from: """
+            opening music. <tool_calls>
+            [[{"tool":"open_app","app":"Music"}]]
+            </tool_calls> done.
+            """
+        )
+
+        #expect(result == "opening music.  done.")
+    }
+
+    @Test func openToolCallBlockWithoutClosingTagCutsAtOpenTag() async throws {
+        let result = StreamingSentenceTTSPipeline.testablyComputeSpeakableSafePrefix(
+            from: "opening music. <tool_calls>[[{\"tool\":\"open_app\""
+        )
+
+        #expect(result == "opening music.")
     }
 
     @Test func openActionTagWithoutClosingBracketCutsAtOpenBracket() async throws {

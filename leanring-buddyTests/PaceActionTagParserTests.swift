@@ -128,12 +128,128 @@ struct PaceActionTagParserTests {
         #expect(amountInLines == 3) // documented default
     }
 
+    @Test func openApplicationTagPreservesDisplayName() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: "opening it. [OPEN_APP:Visual Studio Code]")
+
+        #expect(parseResult.spokenText == "opening it.")
+        guard case .openApplication(let applicationName) = parseResult.actions.first else {
+            Issue.record("Expected an OPEN_APP action")
+            return
+        }
+        #expect(applicationName == "Visual Studio Code")
+    }
+
+    @Test func volumeTagParsesDirectionAndStepCount() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: "[VOLUME:down:4]")
+
+        guard case .adjustVolume(let adjustment) = parseResult.actions.first else {
+            Issue.record("Expected a VOLUME action")
+            return
+        }
+        #expect(adjustment.direction == .down)
+        #expect(adjustment.stepCount == 4)
+    }
+
+    @Test func brightnessTagWithoutStepCountUsesDefault() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: "[BRIGHTNESS:up]")
+
+        guard case .adjustBrightness(let adjustment) = parseResult.actions.first else {
+            Issue.record("Expected a BRIGHTNESS action")
+            return
+        }
+        #expect(adjustment.direction == .up)
+        #expect(adjustment.stepCount == 2)
+    }
+
+    @Test func systemAdjustmentStepCountIsClamped() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: "[VOLUME:up:999]")
+
+        guard case .adjustVolume(let adjustment) = parseResult.actions.first else {
+            Issue.record("Expected a VOLUME action")
+            return
+        }
+        #expect(adjustment.stepCount == 10)
+    }
+
+    @Test func toolCallsBlockPreservesSequentialStepsAndParallelGroups() async throws {
+        let inputResponse = """
+        opening both.
+        <tool_calls>
+        [
+          [
+            {"tool":"open_app","app":"Music"},
+            {"tool":"open_url","url":"https://example.com"}
+          ],
+          [
+            {"tool":"music","command":"play"}
+          ]
+        ]
+        </tool_calls>
+        """
+
+        let parseResult = PaceActionTagParser.parseActions(from: inputResponse)
+
+        #expect(parseResult.spokenText == "opening both.")
+        #expect(parseResult.actions.count == 3)
+        #expect(parseResult.executionPlan.steps.count == 2)
+        #expect(parseResult.executionPlan.steps[0].actions.count == 2)
+        #expect(parseResult.executionPlan.steps[1].actions.count == 1)
+
+        guard case .openApplication(let applicationName) = parseResult.executionPlan.steps[0].actions[0] else {
+            Issue.record("Expected first parallel action to open an app")
+            return
+        }
+        #expect(applicationName == "Music")
+
+        guard case .openURL(let urlString) = parseResult.executionPlan.steps[0].actions[1] else {
+            Issue.record("Expected second parallel action to open a URL")
+            return
+        }
+        #expect(urlString == "https://example.com")
+
+        guard case .controlMusic(let musicCommand) = parseResult.executionPlan.steps[1].actions[0] else {
+            Issue.record("Expected second sequential step to control Music")
+            return
+        }
+        #expect(musicCommand == .play)
+    }
+
+    @Test func calendarAndReminderToolCallsParseIntoReadableTools() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: """
+        checking and saving it.
+        <tool_calls>
+        [
+          [
+            {"tool":"calendar","range":"today"}
+          ],
+          [
+            {"tool":"reminder","title":"send the invoice"}
+          ]
+        ]
+        </tool_calls>
+        """)
+
+        #expect(parseResult.actions.count == 2)
+
+        guard case .listCalendarEvents(let calendarQuery) = parseResult.actions[0] else {
+            Issue.record("Expected a calendar list action")
+            return
+        }
+        #expect(calendarQuery.range == .today)
+
+        guard case .createReminder(let reminderRequest) = parseResult.actions[1] else {
+            Issue.record("Expected a reminder creation action")
+            return
+        }
+        #expect(reminderRequest.title == "send the invoice")
+    }
+
     @Test func chainedActionTagsPreserveSourceOrder() async throws {
-        let inputResponse = "on it. [CLICK:740,80][TYPE:whisper flow][KEY:Return]"
+        let inputResponse = "on it. [CLICK:740,80][TYPE:whisper flow][OPEN_APP:Safari][KEY:Return]"
         let parseResult = PaceActionTagParser.parseActions(from: inputResponse)
 
         #expect(parseResult.spokenText == "on it.")
-        #expect(parseResult.actions.count == 3)
+        #expect(parseResult.actions.count == 4)
 
         if case .click(let firstLocation) = parseResult.actions[0] {
             #expect(firstLocation.xInScreenshotPixels == 740)
@@ -148,10 +264,16 @@ struct PaceActionTagParserTests {
             Issue.record("Second action should be TYPE")
         }
 
-        if case .pressKey(let keyName, _) = parseResult.actions[2] {
+        if case .openApplication(let applicationName) = parseResult.actions[2] {
+            #expect(applicationName == "Safari")
+        } else {
+            Issue.record("Third action should be OPEN_APP")
+        }
+
+        if case .pressKey(let keyName, _) = parseResult.actions[3] {
             #expect(keyName == "return")
         } else {
-            Issue.record("Third action should be KEY")
+            Issue.record("Fourth action should be KEY")
         }
     }
 

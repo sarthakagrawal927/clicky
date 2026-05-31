@@ -1,7 +1,7 @@
 {
   "name": "action-mode-off",
   "category": "action",
-  "description": "User asks the planner to perform an action, but agent-mode rules are NOT in the system prompt (EnableActions=false). Expected: planner refuses to emit CLICK/TYPE tags it was never taught about. This catches the regression where agent rules leak into non-action prompts.",
+  "description": "User asks the planner to perform an action, but agent-mode rules are NOT in the system prompt (EnableActions=false). Expected: planner refuses to emit action tags it was never taught about. This catches the regression where agent rules leak into non-action prompts.",
   "system_prompt_version": 2,
   "request": {
     "messages": [
@@ -25,11 +25,15 @@
       "\\[POINT:"
     ],
     "must_not_contain_patterns": [
+      "<tool_calls",
       "\\[CLICK",
       "\\[DOUBLE_CLICK",
       "\\[TYPE",
       "\\[KEY",
       "\\[SCROLL",
+      "\\[OPEN_APP",
+      "\\[VOLUME",
+      "\\[BRIGHTNESS",
       "\\[DONE\\]"
     ]
   }

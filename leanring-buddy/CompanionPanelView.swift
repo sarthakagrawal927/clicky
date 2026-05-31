@@ -37,7 +37,7 @@ struct CompanionPanelView: View {
                 readScreenToggleRow
                     .padding(.horizontal, 16)
 
-                walkingAvatarToggleRow
+                cursorAnnotationsToggleRow
                     .padding(.horizontal, 16)
             }
 
@@ -458,17 +458,15 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
-    // MARK: - Walking Avatar Toggle
-
-    private var walkingAvatarToggleRow: some View {
+    private var cursorAnnotationsToggleRow: some View {
         HStack {
             HStack(spacing: 8) {
-                Image(systemName: "figure.walk")
+                Image(systemName: "text.bubble")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
 
-                Text("Walking Avatar")
+                Text("Cursor Annotations")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
             }
@@ -476,8 +474,8 @@ struct CompanionPanelView: View {
             Spacer()
 
             Toggle("", isOn: Binding(
-                get: { companionManager.isWalkingAvatarEnabled },
-                set: { companionManager.setWalkingAvatarEnabled($0) }
+                get: { companionManager.areCursorAnnotationsEnabled },
+                set: { companionManager.setCursorAnnotationsEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

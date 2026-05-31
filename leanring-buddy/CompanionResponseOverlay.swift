@@ -52,6 +52,7 @@ final class CompanionResponseOverlayManager {
     private var overlayPanel: NSPanel?
     private var autoHideWorkItem: DispatchWorkItem?
     private var currentAnchor: CompanionResponseOverlayAnchor = .belowRightOfCursor
+    private var annotationsAreEnabled = true
 
     /// Tracks the global mouse so the bubble actually follows the
     /// cursor while it's visible. Set up once on first show; torn down
@@ -75,6 +76,13 @@ final class CompanionResponseOverlayManager {
         currentAnchor = newAnchor
     }
 
+    func setAnnotationsEnabled(_ enabled: Bool) {
+        annotationsAreEnabled = enabled
+        if !enabled {
+            hideOverlay()
+        }
+    }
+
     /// Toggle the stop button on/off. Called by CompanionManager when
     /// dictation enters / leaves the listening state.
     func setListeningForAudio(_ isListening: Bool) {
@@ -88,6 +96,7 @@ final class CompanionResponseOverlayManager {
     }
 
     func showOverlayAndBeginStreaming() {
+        guard annotationsAreEnabled else { return }
         autoHideWorkItem?.cancel()
         autoHideWorkItem = nil
 
@@ -120,6 +129,7 @@ final class CompanionResponseOverlayManager {
     }
 
     func updateStreamingText(_ accumulatedText: String) {
+        guard annotationsAreEnabled else { return }
         overlayViewModel.streamingResponseText = accumulatedText
         resizePanelToFitContent()
     }
@@ -129,6 +139,7 @@ final class CompanionResponseOverlayManager {
     /// false before fading (e.g. "still TTS playing?"). Otherwise it
     /// falls back to a fixed 6-second timer so it doesn't sit forever.
     func finishStreaming(keepVisibleUntil: (@MainActor @Sendable () async -> Bool)? = nil) {
+        guard annotationsAreEnabled else { return }
         autoHideWorkItem?.cancel()
 
         if let keepVisibleUntil {

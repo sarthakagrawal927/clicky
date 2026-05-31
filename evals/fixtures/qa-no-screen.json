@@ -26,10 +26,14 @@
       "(?i)\\[point:none\\]"
     ],
     "must_not_contain_patterns": [
+      "<tool_calls",
       "\\[CLICK",
       "\\[TYPE",
       "\\[KEY",
       "\\[SCROLL",
+      "\\[OPEN_APP",
+      "\\[VOLUME",
+      "\\[BRIGHTNESS",
       "^\\s*[-*]\\s",
       "\\*\\*[A-Za-z]",
       "e\\.g\\.",

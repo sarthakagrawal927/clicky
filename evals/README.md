@@ -45,7 +45,7 @@ Each fixture is a single JSON file under `fixtures/`:
   "expectations": {
     "max_ttft_ms": 1500,
     "must_contain_patterns": ["html", "markup"],
-    "must_not_contain_patterns": ["\\[CLICK", "\\[TYPE", "\\[KEY", "^\\s*-\\s", "\\*\\*"]
+    "must_not_contain_patterns": ["<tool_calls", "\\[CLICK", "\\[TYPE", "\\[KEY", "\\[OPEN_APP", "\\[VOLUME", "\\[BRIGHTNESS", "^\\s*-\\s", "\\*\\*"]
   }
 }
 ```

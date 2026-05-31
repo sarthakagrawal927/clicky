@@ -26,6 +26,14 @@
 	<string>controlOption</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Pace uses your microphone so you can talk to it</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Pace uses calendar access only when you ask it to check your schedule.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Pace uses calendar access only when you ask it to check your schedule.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Pace uses reminders access only when you ask it to create reminders.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Pace uses reminders access only when you ask it to create reminders.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Pace needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
