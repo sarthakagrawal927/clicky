@@ -18,12 +18,14 @@
 	<string>http://localhost:1234/v1</string>
 	<key>LocalPlannerModelIdentifier</key>
 	<string>qwen/qwen3-30b-a3b</string>
+	<key>LocalTTSVoiceIdentifier</key>
+	<string>com.apple.voice.compact.en-IN.Rishi</string>
 	<key>LocalTTSSpeechRate</key>
-	<string>0.48</string>
+	<string>0.44</string>
 	<key>LocalTTSPitchMultiplier</key>
-	<string>0.94</string>
+	<string>0.88</string>
 	<key>LocalTTSVolume</key>
-	<string>0.94</string>
+	<string>0.90</string>
 	<key>LocalTTSPreUtteranceDelay</key>
 	<string>0.0</string>
 	<key>LocalTTSPostUtteranceDelay</key>
@@ -36,6 +38,8 @@
 	<string>controlOption</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Pace uses your microphone so you can talk to it</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Pace uses Apple Events only when you ask it to control local Mac apps like Notes, Music, Mail, Things, Shortcuts, or Messages.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>Pace uses calendar access only when you ask it to check your schedule.</string>
 	<key>NSCalendarsUsageDescription</key>
