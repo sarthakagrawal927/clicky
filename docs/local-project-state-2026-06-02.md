@@ -32,8 +32,7 @@ The latest local `main` includes:
 
 ## Validation Already Performed
 
-- `swiftc -parse -parse-as-library` over modified Swift files passed before the
-  local merge.
+- Swift parser checks over modified app files passed before the local merge.
 - `plutil -lint leanring-buddy/Info.plist` passed.
 - `jq empty evals/fixtures/action-mode-off.json evals/fixtures/qa-no-screen.json`
   passed.

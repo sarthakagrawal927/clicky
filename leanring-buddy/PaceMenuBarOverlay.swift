@@ -413,13 +413,13 @@ private struct PaceMenuBarAvatarGlyph: View {
     var body: some View {
         ZStack {
             if isActive {
-                Circle()
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .stroke(avatarGlowColor.opacity(0.32), lineWidth: 1.5)
-                    .scaleEffect(isPulsing ? 1.18 : 0.94)
+                    .scaleEffect(isPulsing ? 1.15 : 0.96)
                     .opacity(isPulsing ? 0.08 : 0.42)
             }
 
-            Circle()
+            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: avatarGradientColors,
@@ -428,16 +428,28 @@ private struct PaceMenuBarAvatarGlyph: View {
                     )
                 )
                 .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.38), lineWidth: 0.7)
+                    RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                        .stroke(Color.white.opacity(0.30), lineWidth: 0.7)
                 )
                 .shadow(color: avatarGlowColor.opacity(0.34), radius: 4.5, x: 0, y: 0)
 
-            Image(systemName: symbolName)
-                .font(.system(size: symbolSize, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.94))
-                .frame(width: 12, height: 12)
-                .contentTransition(.symbolEffect(.replace))
+            VStack(spacing: 2.4) {
+                HStack(spacing: 3.2) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.94))
+                        .frame(width: 3.2, height: eyeHeight)
+
+                    Capsule()
+                        .fill(Color.white.opacity(0.94))
+                        .frame(width: 3.2, height: trailingEyeHeight)
+                }
+
+                Capsule()
+                    .fill(Color.white.opacity(isActive ? 0.58 : 0.36))
+                    .frame(width: isActive ? 8.2 : 6.8, height: 1.5)
+            }
+            .animation(.easeInOut(duration: 0.34), value: voiceState)
+            .animation(.easeInOut(duration: 0.62), value: isPulsing)
         }
         .frame(width: 18, height: 18)
         .onAppear {
@@ -447,29 +459,29 @@ private struct PaceMenuBarAvatarGlyph: View {
         }
     }
 
-    private var symbolName: String {
+    private var eyeHeight: CGFloat {
         switch voiceState {
         case .idle:
-            return "person.fill"
+            return 3.5
         case .listening:
-            return "waveform"
+            return isPulsing ? 6.2 : 3.8
         case .processing:
-            return "sparkles"
+            return isPulsing ? 4.6 : 5.8
         case .responding:
-            return "text.bubble.fill"
+            return isPulsing ? 5.6 : 3.8
         }
     }
 
-    private var symbolSize: CGFloat {
+    private var trailingEyeHeight: CGFloat {
         switch voiceState {
         case .idle:
-            return 9.2
+            return 3.5
         case .listening:
-            return 9.6
+            return isPulsing ? 4.0 : 6.0
         case .processing:
-            return 9.4
+            return isPulsing ? 5.8 : 4.6
         case .responding:
-            return 8.8
+            return isPulsing ? 3.8 : 5.6
         }
     }
 

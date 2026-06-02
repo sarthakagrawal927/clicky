@@ -3,11 +3,10 @@
 //  leanring-buddy
 //
 //  Menu bar-only companion app. No dock icon, no main window — just an
-//  always-available status item in the macOS menu bar. Clicking the icon
-//  opens a floating panel with companion voice controls.
+//  always-available notch/menu-bar overlay. Clicking the overlay opens
+//  a floating panel with companion voice controls.
 //
 
-import Combine
 import ServiceManagement
 import SwiftUI
 
@@ -41,7 +40,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // running (e.g. login-item launched at boot and now Xcode is
         // Cmd+R'ing a dev build on top), the newer launch wins —
         // terminate the older instance so the user doesn't see two
-        // walking avatars, two cursors, and two menu-bar icons. Bug
+        // walking avatars, two cursors, and two notch overlays. Bug
         // confirmed by `ps -ax | grep Pace` showing duplicate PIDs.
         terminateOtherRunningPaceInstances()
 
@@ -90,7 +89,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     /// at launch so a duplicate launch (Xcode Cmd+R landing on top of
     /// a login-item Pace, or a Finder double-launch) doesn't end up
     /// with two of every visual — two avatars, two cursor overlays,
-    /// two menu-bar icons. Each prior instance is asked to terminate
+    /// two notch overlays. Each prior instance is asked to terminate
     /// cooperatively first; force-killed if it doesn't respond.
     private func terminateOtherRunningPaceInstances() {
         guard let myBundleIdentifier = Bundle.main.bundleIdentifier else { return }
