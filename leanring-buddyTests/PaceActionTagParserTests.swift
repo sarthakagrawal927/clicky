@@ -307,4 +307,85 @@ struct PaceActionTagParserTests {
         #expect(parseResult.actions.isEmpty)
         #expect(parseResult.spokenText == "ok.")
     }
+
+    @Test func appleAppToolCallsParseIntoLocalTools() async throws {
+        let parseResult = PaceActionTagParser.parseActions(from: """
+        setting that up.
+        <tool_calls>
+        [
+          [
+            {"tool":"finder","path":"~/Downloads","action":"reveal"},
+            {"tool":"notes","title":"Idea","body":"Build the Pace registry"}
+          ],
+          [
+            {"tool":"mail","to":"alex@example.com","subject":"Hello","body":"Draft only"},
+            {"tool":"things","title":"Follow up","notes":"from Pace"}
+          ],
+          [
+            {"tool":"shortcuts","name":"Morning"},
+            {"tool":"messages","recipient":"Alex","text":"Draft text"}
+          ]
+        ]
+        </tool_calls>
+        """)
+
+        #expect(parseResult.spokenText == "setting that up.")
+        #expect(parseResult.actions.count == 6)
+        #expect(parseResult.executionPlan.steps.count == 3)
+
+        guard case .finder(let finderRequest) = parseResult.actions[0] else {
+            Issue.record("Expected Finder action")
+            return
+        }
+        #expect(finderRequest.path == "~/Downloads")
+        #expect(finderRequest.action == .reveal)
+
+        guard case .createNote(let noteRequest) = parseResult.actions[1] else {
+            Issue.record("Expected Notes action")
+            return
+        }
+        #expect(noteRequest.title == "Idea")
+        #expect(noteRequest.body == "Build the Pace registry")
+
+        guard case .composeMail(let mailDraft) = parseResult.actions[2] else {
+            Issue.record("Expected Mail action")
+            return
+        }
+        #expect(mailDraft.recipients == ["alex@example.com"])
+        #expect(mailDraft.subject == "Hello")
+
+        guard case .createThingsToDo(let thingsRequest) = parseResult.actions[3] else {
+            Issue.record("Expected Things action")
+            return
+        }
+        #expect(thingsRequest.title == "Follow up")
+        #expect(thingsRequest.notes == "from Pace")
+
+        guard case .runShortcut(let shortcutName) = parseResult.actions[4] else {
+            Issue.record("Expected Shortcuts action")
+            return
+        }
+        #expect(shortcutName == "Morning")
+
+        guard case .openMessages(let messageRequest) = parseResult.actions[5] else {
+            Issue.record("Expected Messages action")
+            return
+        }
+        #expect(messageRequest.recipient == "Alex")
+        #expect(messageRequest.text == "Draft text")
+    }
+
+    @Test func registryProvidesPlannerPromptEntriesAndRiskLabels() async throws {
+        #expect(PaceToolRegistry.kind(forToolName: "open-website") == .openURL)
+        #expect(PaceToolRegistry.kind(forToolName: "run_shortcut") == .shortcuts)
+        #expect(PaceToolRegistry.plannerToolListText.contains(#""tool":"notes""#))
+        #expect(PaceToolRegistry.plannerToolListText.contains(#""tool":"things""#))
+
+        let actionPlan = PaceActionExecutionPlan.serial(actions: [
+            .listCalendarEvents(PaceCalendarQuery(range: .today)),
+            .type("hello")
+        ])
+        #expect(actionPlan.approvalSummary.contains("[read-only]"))
+        #expect(actionPlan.approvalSummary.contains("[input injection]"))
+    }
 }

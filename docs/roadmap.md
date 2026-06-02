@@ -5,17 +5,17 @@ ship MCP integrations.
 
 ## Priority 1: Approval And Safety
 
-Status: in progress.
+Status: implemented; manual runtime verification still needed.
 
 - Ask before executing local tool calls.
 - Keep approval default-on.
-- Add clearer risk labels for actions later: read-only, app/system mutation,
+- Add clearer risk labels for actions: read-only, app/system mutation,
   input injection, and destructive.
 - Keep `EnableActions` as the hard kill switch.
 
 ## Priority 2: Typed Tool Registry
 
-Status: next highest ROI.
+Status: implemented.
 
 - Move tools out of prompt text and parser switch cases into a typed registry.
 - Each tool should define name, schema, description, risk level, executor, and
@@ -25,39 +25,45 @@ Status: next highest ROI.
 
 ## Priority 3: Apple App Integrations
 
-Status: planned.
+Status: implemented for first local tool pass; needs runtime verification per app.
 
 - Calendar and Reminders exist as local EventKit tools.
-- Next useful tools: Things, Notes, Mail, Finder, Shortcuts, and Messages.
+- Things, Notes, Mail drafts, Finder, Shortcuts, and Messages opening are
+  registered as local tools.
 - Prefer local macOS APIs or AppleScript only when the app does not expose a
   better native API.
 
 ## Priority 4: Watch Mode
 
-Status: planned.
+Status: implemented with panel trigger; voice trigger still optional follow-up.
 
 - `PaceScreenImageDiffer` exists as the screen-change primitive.
-- Next step: a watch loop that samples the screen and only sends a frame when
+- `PaceScreenWatchModeController` samples the screen and emits events only when
   the image diff crosses a meaningful threshold.
-- The first watch mode should be explicit: the user asks Pace to watch for a
-  while, then Pace reports or assists based on changes.
+- The first watch mode is explicit through the `Watch Mode` panel toggle. Pace
+  reports meaningful screen changes while it is on.
 
 ## Priority 5: Local Intent Classifier
 
-Status: planned.
+Status: implemented as a rule-based scaffold.
 
 - Add a tiny local classifier for routing turns into:
   - answer directly
   - read screen
   - execute tool
   - phone large model
-- Keep the large planner for hard reasoning; use the classifier to avoid
-  unnecessary VLM/planner calls.
+- Pure-knowledge turns now use a text-only planner path to avoid unnecessary
+  screen capture/VLM work.
+- Phone-large-model is classified and logged, but there is intentionally no
+  cloud model transport wired yet.
 
 ## Priority 6: Tests
 
 Status: ongoing.
 
 - Keep parser and image-diff tests current.
-- Add dry-run executor tests once the tool registry exists.
-- Add Xcode-run smoke tests for approval prompts and action cancellation.
+- Parser tests cover registry aliases and Apple app tool parsing.
+- Image-diff tests cover watch-mode change throttling.
+- Intent tests cover the route mapping.
+- Still needed: Xcode-run smoke tests for approval prompts and action
+  cancellation.

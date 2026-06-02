@@ -8,6 +8,7 @@
 //    .pureKnowledge       "what is HTML"          → skip VLM, skip OCR/AX
 //    .screenDescription   "what's on screen"      → run AX+OCR, maybe skip VLM
 //    .screenAction        "click the save button" → full pipeline
+//    .phoneLargeModel     "ask the big model"     → reserved escalation route
 //    .chitchat            "hi pace", "thanks"     → skip VLM, skip planner
 //
 //  Today this is a rule-based / keyword matcher. The training corpus at
@@ -41,6 +42,11 @@ enum PaceIntent: String, CaseIterable {
     /// Greeting or social filler. Canned response is fine. e.g. "hi pace".
     case chitchat
 
+    /// Explicit escalation request. No cloud path is wired today, but
+    /// the route exists so the product can add "phone a large model"
+    /// behind one switch without retraining the classifier.
+    case phoneLargeModel
+
     /// Classifier could not confidently assign one of the above. The
     /// caller MUST treat this as "run the full pipeline" — never skip
     /// the VLM or planner on an unknown intent.
@@ -53,6 +59,32 @@ enum PaceIntent: String, CaseIterable {
 struct PaceIntentPrediction: Equatable {
     let intent: PaceIntent
     let confidence: Double
+
+    var route: PaceIntentRoute {
+        switch intent {
+        case .chitchat:
+            return .chitchatFastPath
+        case .pureKnowledge:
+            return .answerDirectly
+        case .screenDescription:
+            return .readScreen
+        case .screenAction:
+            return .executeTool
+        case .phoneLargeModel:
+            return .phoneLargeModel
+        case .unknown:
+            return .fullPipeline
+        }
+    }
+}
+
+enum PaceIntentRoute: String, Equatable {
+    case chitchatFastPath
+    case answerDirectly
+    case readScreen
+    case executeTool
+    case phoneLargeModel
+    case fullPipeline
 }
 
 @MainActor
@@ -132,6 +164,12 @@ final class PaceIntentClassifier {
         "what's this all about", "lay out what's on the screen",
     ]
 
+    private static let largeModelHints: [String] = [
+        "phone a large model", "ask the big model", "use the big model",
+        "use a large model", "call the large model", "hard mode",
+        "think deeply", "deep research this", "stronger model",
+    ]
+
     private func ruleBasedClassify(_ transcript: String) -> PaceIntentPrediction {
         let lowercaseTranscript = transcript.lowercased()
 
@@ -142,6 +180,12 @@ final class PaceIntentClassifier {
                 || lowercaseTranscript.hasPrefix(chitchatPhrase + " ")
                 || lowercaseTranscript == chitchatPhrase + "." {
                 return PaceIntentPrediction(intent: .chitchat, confidence: 0.95)
+            }
+        }
+
+        for largeModelHint in Self.largeModelHints {
+            if lowercaseTranscript.contains(largeModelHint) {
+                return PaceIntentPrediction(intent: .phoneLargeModel, confidence: 0.90)
             }
         }
 

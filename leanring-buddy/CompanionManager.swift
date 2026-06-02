@@ -124,6 +124,9 @@ final class CompanionManager: ObservableObject {
     /// identifies elements; OCR delivers verbatim text — merged by
     /// bbox overlap. Cheap (~50-200ms), no model load.
     private let visionOCRClient = PaceVisionOCRClient()
+    private lazy var screenWatchModeController: PaceScreenWatchModeController = {
+        PaceScreenWatchModeController()
+    }()
 
     /// Fast-tier screen reader. AX tree of the focused window in 5-50ms,
     /// vs 800ms-3s for the VLM. If AX returns ≥1 element we use it +
@@ -286,6 +289,44 @@ final class CompanionManager: ObservableObject {
     func setRequiresActionApproval(_ enabled: Bool) {
         requiresActionApproval = enabled
         PaceUserPreferencesStore.setBool(enabled, for: .requiresActionApproval)
+    }
+
+    @Published private(set) var isWatchModeEnabled: Bool = false
+    @Published private(set) var latestWatchModeSummary: String?
+
+    func setWatchModeEnabled(_ enabled: Bool) {
+        guard enabled != isWatchModeEnabled else { return }
+        isWatchModeEnabled = enabled
+
+        if enabled {
+            latestWatchModeSummary = "Watching for screen changes"
+            screenWatchModeController.startWatching { [weak self] event in
+                await self?.handleWatchModeEvent(event)
+            }
+        } else {
+            screenWatchModeController.stopWatching()
+            latestWatchModeSummary = nil
+        }
+    }
+
+    private func handleWatchModeEvent(_ event: PaceScreenWatchEvent) async {
+        let summary = "Screen changed: \(event.screenLabel)"
+        latestWatchModeSummary = summary
+        print("👀 Watch mode: \(summary) meanDelta=\(String(format: "%.2f", event.diff.meanPixelDelta)) changedRatio=\(String(format: "%.3f", event.diff.changedPixelRatio))")
+
+        guard voiceState == .idle else { return }
+
+        responseOverlayManager.showOverlayAndBeginStreaming()
+        responseOverlayManager.updateStreamingText("i noticed the screen changed.")
+        currentResponseTask = Task {
+            voiceState = .responding
+            await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: "i noticed the screen changed.")
+            while ttsClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+            responseOverlayManager.finishStreaming()
+            voiceState = .idle
+        }
     }
 
     private func requestUserApprovalForActionPlan(_ actionExecutionPlan: PaceActionExecutionPlan) -> Bool {
@@ -832,6 +873,68 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Fast path for pure knowledge questions. Skips screenshot capture,
+    /// AX, OCR, and VLM. The local planner still answers, but it gets a
+    /// text-only prompt and no agent-mode tool docs.
+    private func handleTextOnlyPlannerFastPath(transcript: String) {
+        responseOverlayManager.showOverlayAndBeginStreaming()
+
+        currentResponseTask = Task {
+            voiceState = .processing
+
+            do {
+                let historyForPlanner = conversationHistory.map { entry in
+                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                }
+
+                let (fullResponseText, _) = try await plannerClient.generateResponseStreaming(
+                    images: [],
+                    systemPrompt: CompanionSystemPrompt.build(includeAgentMode: false),
+                    conversationHistory: historyForPlanner,
+                    userPrompt: transcript,
+                    onTextChunk: { [weak self] accumulatedPlannerText in
+                        self?.responseOverlayManager.updateStreamingText(accumulatedPlannerText)
+                        Task { @MainActor [weak self] in
+                            await self?.streamingSentenceTTSPipeline.acceptStreamedText(accumulatedPlannerText)
+                        }
+                    }
+                )
+                guard !Task.isCancelled else { return }
+
+                let actionParseResult = PaceActionTagParser.parseActions(from: fullResponseText)
+                let (_, textAfterDoneStrip) = PaceTagParsers.parseAndStripDoneSignal(from: actionParseResult.spokenText)
+                let pointingParseResult = PaceTagParsers.parsePointingCoordinates(from: textAfterDoneStrip)
+                let spokenText = pointingParseResult.spokenText
+
+                conversationHistory.append((userTranscript: transcript, assistantResponse: spokenText))
+                if conversationHistory.count > 1 {
+                    conversationHistory.removeFirst(conversationHistory.count - 1)
+                }
+
+                responseOverlayManager.updateStreamingText(spokenText)
+                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: spokenText)
+                    voiceState = .responding
+                }
+
+                while ttsClient.isPlaying {
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                }
+
+                responseOverlayManager.finishStreaming()
+                voiceState = .idle
+                if isWalkingAvatarEnabled {
+                    avatarOverlayManager?.show()
+                }
+            } catch {
+                print("⚠️ Text-only planner fast path failed: \(error.localizedDescription)")
+                responseOverlayManager.updateStreamingText("i hit a local planner issue.")
+                responseOverlayManager.finishStreaming()
+                voiceState = .idle
+            }
+        }
+    }
+
     /// Multi-step agent loop: capture screens → optional local VLM →
     /// planner → execute actions → re-screenshot → repeat. Each step is
     /// at most one planner round-trip and one action sequence. The loop
@@ -865,7 +968,15 @@ final class CompanionManager: ObservableObject {
             handleChitchatFastPath(transcript: transcript)
             return
         }
-        print("🎯 Intent: \(intentPrediction.intent.rawValue) (confidence \(String(format: "%.2f", intentPrediction.confidence))) — full pipeline")
+        if intentPrediction.route == .answerDirectly {
+            print("🎯 Intent: pureKnowledge (confidence \(String(format: "%.2f", intentPrediction.confidence))) — text-only planner")
+            handleTextOnlyPlannerFastPath(transcript: transcript)
+            return
+        }
+        if intentPrediction.route == .phoneLargeModel {
+            print("🎯 Intent: phoneLargeModel requested — local-only fallback pipeline")
+        }
+        print("🎯 Intent: \(intentPrediction.intent.rawValue) (confidence \(String(format: "%.2f", intentPrediction.confidence))) — \(intentPrediction.route.rawValue)")
 
         currentResponseTask = Task {
             voiceState = .processing

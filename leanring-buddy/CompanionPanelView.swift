@@ -42,6 +42,9 @@ struct CompanionPanelView: View {
 
                 actionApprovalToggleRow
                     .padding(.horizontal, 16)
+
+                watchModeToggleRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -512,6 +515,41 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.requiresActionApproval },
                 set: { companionManager.setRequiresActionApproval($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var watchModeToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "eye.trianglebadge.exclamationmark")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(companionManager.isWatchModeEnabled ? DS.Colors.accent : DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Watch Mode")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Text(companionManager.latestWatchModeSummary ?? "Report meaningful screen changes")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isWatchModeEnabled },
+                set: { companionManager.setWatchModeEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

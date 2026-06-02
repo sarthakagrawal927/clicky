@@ -26,9 +26,16 @@ The latest local `main` includes:
   arrays are parallel.
 - Local action tools for apps, URLs, Music, volume, brightness, Calendar, and
   Reminders.
+- Local tool registry for planner docs, aliases, risk labels, approval
+  summaries, and future MCP bridge work.
+- First-pass Apple app tools: Finder, Notes, Mail drafts, Things, Shortcuts,
+  and Messages opening.
 - Action approval toggle and popup before local tools control the Mac.
-- Screen image diffing primitive for watch-mode capture gating.
-- Parser, TTS-stripping, and image-diff tests.
+- Screen image diffing plus explicit watch-mode controller and panel toggle for
+  meaningful change events.
+- Rule-based intent classifier routes chitchat, pure-knowledge, screen-read,
+  tool-action, and phone-large-model turns.
+- Parser, TTS-stripping, image-diff, watch-mode, registry, and intent tests.
 - Updated `AGENTS.md` architecture notes.
 
 ## Validation Already Performed
@@ -54,6 +61,8 @@ The latest local `main` includes:
   - Music controls
   - Calendar reads
   - Reminder creation
+  - Finder/Notes/Mail/Things/Shortcuts/Messages tools
+- Add optional voice command for watch mode start/stop.
 - Treat `EnableActions` carefully because enabled action mode can post real
   local input and system actions.
 - Keep `Approve Actions` on unless actively testing automation speed.

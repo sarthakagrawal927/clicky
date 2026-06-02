@@ -43,6 +43,7 @@ struct PaceIntentClassifierTests {
         ] {
             let prediction = classifier.classify(question)
             #expect(prediction.intent == .pureKnowledge, "expected pureKnowledge for \(question), got \(prediction.intent)")
+            #expect(prediction.route == .answerDirectly)
         }
     }
 
@@ -56,6 +57,7 @@ struct PaceIntentClassifierTests {
         ] {
             let prediction = classifier.classify(request)
             #expect(prediction.intent == .screenDescription, "expected screenDescription for \(request), got \(prediction.intent)")
+            #expect(prediction.route == .readScreen)
         }
     }
 
@@ -69,6 +71,20 @@ struct PaceIntentClassifierTests {
         ] {
             let prediction = classifier.classify(command)
             #expect(prediction.intent == .screenAction, "expected screenAction for \(command), got \(prediction.intent)")
+            #expect(prediction.route == .executeTool)
+        }
+    }
+
+    @Test func explicitLargeModelRequestsRouteToPhoneLargeModel() async throws {
+        let classifier = PaceIntentClassifier()
+        for request in [
+            "phone a large model for this",
+            "ask the big model",
+            "use a large model and think deeply",
+        ] {
+            let prediction = classifier.classify(request)
+            #expect(prediction.intent == .phoneLargeModel, "expected phoneLargeModel for \(request), got \(prediction.intent)")
+            #expect(prediction.route == .phoneLargeModel)
         }
     }
 
@@ -97,6 +113,7 @@ struct PaceIntentClassifierTests {
         let classifier = PaceIntentClassifier()
         let prediction = classifier.classify("the weather is nice today")
         #expect(prediction.intent == .unknown)
+        #expect(prediction.route == .fullPipeline)
     }
 
     @Test func confidenceFloorDowngradesLowQualityPrediction() async throws {

@@ -138,6 +138,18 @@ final class PaceActionExecutor {
             return await listCalendarEvents(calendarQuery)
         case .createReminder(let reminderRequest):
             return await createReminder(reminderRequest)
+        case .finder(let finderRequest):
+            return await performFinderRequest(finderRequest)
+        case .createNote(let noteRequest):
+            return await createNote(noteRequest)
+        case .composeMail(let mailDraft):
+            return await composeMail(mailDraft)
+        case .createThingsToDo(let thingsToDoRequest):
+            return await createThingsToDo(thingsToDoRequest)
+        case .runShortcut(let shortcutName):
+            return await runShortcut(named: shortcutName)
+        case .openMessages(let messageRequest):
+            return await openMessages(messageRequest)
         }
 
         return nil
@@ -468,6 +480,197 @@ final class PaceActionExecutor {
         }
     }
 
+    private func performFinderRequest(_ finderRequest: PaceFinderRequest) async -> PaceActionExecutionObservation {
+        let expandedPath = NSString(string: finderRequest.path).expandingTildeInPath
+        let fileURL = URL(fileURLWithPath: expandedPath)
+        print("🧰 Finder \(finderRequest.action.rawValue) \"\(expandedPath)\" (enabled: \(actionsAreEnabled))")
+
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "finder",
+                summary: "Would \(finderRequest.action.rawValue) path: \(expandedPath)"
+            )
+        }
+
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            return PaceActionExecutionObservation(
+                toolName: "finder",
+                summary: "Path does not exist: \(expandedPath)"
+            )
+        }
+
+        switch finderRequest.action {
+        case .open:
+            let didOpen = NSWorkspace.shared.open(fileURL)
+            return PaceActionExecutionObservation(
+                toolName: "finder",
+                summary: didOpen ? "Opened path: \(expandedPath)" : "Failed to open path: \(expandedPath)"
+            )
+        case .reveal:
+            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+            return PaceActionExecutionObservation(
+                toolName: "finder",
+                summary: "Revealed path in Finder: \(expandedPath)"
+            )
+        }
+    }
+
+    private func createNote(_ noteRequest: PaceNoteRequest) async -> PaceActionExecutionObservation {
+        print("🧰 Notes create \"\(noteRequest.title)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "notes",
+                summary: "Would create note: \(noteRequest.title)"
+            )
+        }
+
+        await openApplication(named: "Notes")
+        let scriptResult = runAppleScript(source: """
+        tell application "Notes"
+            activate
+            make new note at default account with properties {name:"\(Self.appleScriptEscaped(noteRequest.title))", body:"\(Self.appleScriptEscaped(noteRequest.body))"}
+        end tell
+        """)
+
+        if let errorDescription = scriptResult.errorDescription {
+            return PaceActionExecutionObservation(
+                toolName: "notes",
+                summary: "Failed to create note: \(errorDescription)"
+            )
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "notes",
+            summary: "Created note: \(noteRequest.title)"
+        )
+    }
+
+    private func composeMail(_ mailDraft: PaceMailDraft) async -> PaceActionExecutionObservation {
+        print("🧰 Mail compose \"\(mailDraft.subject)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "mail",
+                summary: "Would compose mail draft: \(mailDraft.subject)"
+            )
+        }
+
+        await openApplication(named: "Mail")
+        let recipientLines = mailDraft.recipients.map { recipient in
+            "make new to recipient at end of to recipients with properties {address:\"\(Self.appleScriptEscaped(recipient))\"}"
+        }
+        .joined(separator: "\n            ")
+
+        let scriptResult = runAppleScript(source: """
+        tell application "Mail"
+            activate
+            set newMessage to make new outgoing message with properties {subject:"\(Self.appleScriptEscaped(mailDraft.subject))", content:"\(Self.appleScriptEscaped(mailDraft.body))", visible:true}
+            tell newMessage
+                \(recipientLines)
+            end tell
+        end tell
+        """)
+
+        if let errorDescription = scriptResult.errorDescription {
+            return PaceActionExecutionObservation(
+                toolName: "mail",
+                summary: "Failed to compose mail draft: \(errorDescription)"
+            )
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "mail",
+            summary: "Created mail draft: \(mailDraft.subject)"
+        )
+    }
+
+    private func createThingsToDo(_ request: PaceThingsToDoRequest) async -> PaceActionExecutionObservation {
+        print("🧰 Things create \"\(request.title)\" (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "things",
+                summary: "Would create Things to-do: \(request.title)"
+            )
+        }
+
+        guard Self.findApplicationURL(named: "Things3") != nil || Self.findApplicationURL(named: "Things") != nil else {
+            return PaceActionExecutionObservation(
+                toolName: "things",
+                summary: "Things is not installed."
+            )
+        }
+
+        let notesClause = request.notes.map { "notes:\"\(Self.appleScriptEscaped($0))\"" } ?? "notes:\"\""
+        let scriptResult = runAppleScript(source: """
+        tell application "Things3"
+            activate
+            make new to do with properties {name:"\(Self.appleScriptEscaped(request.title))", \(notesClause)}
+        end tell
+        """)
+
+        if let errorDescription = scriptResult.errorDescription {
+            return PaceActionExecutionObservation(
+                toolName: "things",
+                summary: "Failed to create Things to-do: \(errorDescription)"
+            )
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "things",
+            summary: "Created Things to-do: \(request.title)"
+        )
+    }
+
+    private func runShortcut(named shortcutName: String) async -> PaceActionExecutionObservation {
+        let trimmedShortcutName = shortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
+        print("🧰 Shortcuts run \"\(trimmedShortcutName)\" (enabled: \(actionsAreEnabled))")
+        guard !trimmedShortcutName.isEmpty else {
+            return PaceActionExecutionObservation(toolName: "shortcuts", summary: "No shortcut name was provided.")
+        }
+
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "shortcuts",
+                summary: "Would run shortcut: \(trimmedShortcutName)"
+            )
+        }
+
+        let scriptResult = runAppleScript(source: """
+        tell application "Shortcuts Events"
+            run shortcut "\(Self.appleScriptEscaped(trimmedShortcutName))"
+        end tell
+        """)
+
+        if let errorDescription = scriptResult.errorDescription {
+            return PaceActionExecutionObservation(
+                toolName: "shortcuts",
+                summary: "Failed to run shortcut: \(errorDescription)"
+            )
+        }
+
+        return PaceActionExecutionObservation(
+            toolName: "shortcuts",
+            summary: "Ran shortcut: \(trimmedShortcutName)"
+        )
+    }
+
+    private func openMessages(_ request: PaceMessageRequest) async -> PaceActionExecutionObservation {
+        print("🧰 Messages open (enabled: \(actionsAreEnabled))")
+        guard actionsAreEnabled else {
+            return PaceActionExecutionObservation(
+                toolName: "messages",
+                summary: "Would open Messages."
+            )
+        }
+
+        await openApplication(named: "Messages")
+        return PaceActionExecutionObservation(
+            toolName: "messages",
+            summary: request.recipient?.isEmpty == false
+                ? "Opened Messages. Recipient requested: \(request.recipient!)."
+                : "Opened Messages."
+        )
+    }
+
     private func postAuxiliaryKeyEvent(keyType: Int32) {
         let keyDownData = (keyType << 16) | (0xA << 8)
         let keyUpData = (keyType << 16) | (0xB << 8)
@@ -577,6 +780,14 @@ final class PaceActionExecutor {
         }
 
         return nil
+    }
+
+    private static func appleScriptEscaped(_ rawValue: String) -> String {
+        rawValue
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
     }
 
     private static func findApplicationURL(
@@ -785,10 +996,11 @@ struct PaceActionExecutionPlan {
             .flatMap { stepIndex, step in
                 step.actions.enumerated().map { actionIndex, action in
                     let stepLabel = "Step \(stepIndex + 1)"
+                    let riskLabel = PaceToolRegistry.riskDisplayName(for: action)
                     if step.actions.count == 1 {
-                        return "\(stepLabel): \(action.approvalDescription)"
+                        return "\(stepLabel): [\(riskLabel)] \(action.approvalDescription)"
                     }
-                    return "\(stepLabel).\(actionIndex + 1): \(action.approvalDescription)"
+                    return "\(stepLabel).\(actionIndex + 1): [\(riskLabel)] \(action.approvalDescription)"
                 }
             }
             .joined(separator: "\n")
@@ -814,6 +1026,12 @@ enum PaceParsedAction {
     case adjustBrightness(PaceSystemAdjustment)
     case listCalendarEvents(PaceCalendarQuery)
     case createReminder(PaceReminderRequest)
+    case finder(PaceFinderRequest)
+    case createNote(PaceNoteRequest)
+    case composeMail(PaceMailDraft)
+    case createThingsToDo(PaceThingsToDoRequest)
+    case runShortcut(String)
+    case openMessages(PaceMessageRequest)
 
     var approvalDescription: String {
         switch self {
@@ -844,6 +1062,21 @@ enum PaceParsedAction {
             return "Read Calendar: \(calendarQuery.range.displayName)"
         case .createReminder(let reminderRequest):
             return "Create reminder: \(reminderRequest.title)"
+        case .finder(let finderRequest):
+            return "Finder \(finderRequest.action.rawValue): \(finderRequest.path)"
+        case .createNote(let noteRequest):
+            return "Create note: \(noteRequest.title)"
+        case .composeMail(let mailDraft):
+            return "Compose mail draft: \(mailDraft.subject)"
+        case .createThingsToDo(let thingsToDoRequest):
+            return "Create Things to-do: \(thingsToDoRequest.title)"
+        case .runShortcut(let shortcutName):
+            return "Run shortcut: \(shortcutName)"
+        case .openMessages(let messageRequest):
+            if let recipient = messageRequest.recipient, !recipient.isEmpty {
+                return "Open Messages for: \(recipient)"
+            }
+            return "Open Messages"
         }
     }
 }
@@ -927,6 +1160,37 @@ struct PaceReminderRequest {
     let notes: String?
 }
 
+struct PaceFinderRequest {
+    let path: String
+    let action: PaceFinderAction
+}
+
+enum PaceFinderAction: String, Equatable {
+    case open
+    case reveal
+}
+
+struct PaceNoteRequest {
+    let title: String
+    let body: String
+}
+
+struct PaceMailDraft {
+    let recipients: [String]
+    let subject: String
+    let body: String
+}
+
+struct PaceThingsToDoRequest {
+    let title: String
+    let notes: String?
+}
+
+struct PaceMessageRequest {
+    let recipient: String?
+    let text: String?
+}
+
 // MARK: - Action tag parser
 
 /// Result of pulling all action tags out of Claude's response.
@@ -955,9 +1219,15 @@ enum PaceActionTagParser {
         let direction: String?
         let title: String?
         let text: String?
+        let body: String?
         let notes: String?
         let range: String?
         let key: String?
+        let path: String?
+        let action: String?
+        let to: String?
+        let subject: String?
+        let recipient: String?
         let steps: Int?
         let amount: Int?
         let x: Int?
@@ -965,7 +1235,7 @@ enum PaceActionTagParser {
         let screen: Int?
 
         enum CodingKeys: String, CodingKey {
-            case tool, app, name, url, command, direction, title, text, notes, range, key, steps, amount, x, y, screen
+            case tool, app, name, url, command, direction, title, text, body, notes, range, key, path, action, to, subject, recipient, steps, amount, x, y, screen
         }
 
         init(from decoder: Decoder) throws {
@@ -978,9 +1248,15 @@ enum PaceActionTagParser {
             self.direction = Self.decodeStringIfPresent(from: container, forKey: .direction)
             self.title = Self.decodeStringIfPresent(from: container, forKey: .title)
             self.text = Self.decodeStringIfPresent(from: container, forKey: .text)
+            self.body = Self.decodeStringIfPresent(from: container, forKey: .body)
             self.notes = Self.decodeStringIfPresent(from: container, forKey: .notes)
             self.range = Self.decodeStringIfPresent(from: container, forKey: .range)
             self.key = Self.decodeStringIfPresent(from: container, forKey: .key)
+            self.path = Self.decodeStringIfPresent(from: container, forKey: .path)
+            self.action = Self.decodeStringIfPresent(from: container, forKey: .action)
+            self.to = Self.decodeStringIfPresent(from: container, forKey: .to)
+            self.subject = Self.decodeStringIfPresent(from: container, forKey: .subject)
+            self.recipient = Self.decodeStringIfPresent(from: container, forKey: .recipient)
             self.steps = Self.decodeIntIfPresent(from: container, forKey: .steps)
             self.amount = Self.decodeIntIfPresent(from: container, forKey: .amount)
             self.x = Self.decodeIntIfPresent(from: container, forKey: .x)
@@ -1180,22 +1456,21 @@ enum PaceActionTagParser {
     }
 
     private static func parseToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
-        let normalizedToolName = toolCall.tool
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
+        guard let toolKind = PaceToolRegistry.kind(forToolName: toolCall.tool) else {
+            return nil
+        }
 
-        switch normalizedToolName {
-        case "click":
+        switch toolKind {
+        case .click:
             return parseToolCallLocation(toolCall).map { .click($0) }
-        case "double_click", "doubleclick":
+        case .doubleClick:
             return parseToolCallLocation(toolCall).map { .doubleClick($0) }
-        case "type":
+        case .type:
             guard let text = toolCall.text, !text.isEmpty else { return nil }
             return .type(text)
-        case "key", "press_key":
+        case .key:
             return parseKeyPayload(toolCall.key ?? toolCall.command ?? "")
-        case "scroll":
+        case .scroll:
             return parseScrollPayload(
                 [
                     toolCall.direction,
@@ -1204,13 +1479,13 @@ enum PaceActionTagParser {
                 .compactMap { $0 }
                 .joined(separator: ":")
             )
-        case "open_app", "open_application":
+        case .openApp:
             return parseOpenApplicationPayload(toolCall.app ?? toolCall.name ?? "")
-        case "open_url", "open_website", "website":
+        case .openURL:
             return parseOpenURLPayload(toolCall.url ?? toolCall.text ?? "")
-        case "music":
+        case .music:
             return parseMusicPayload(toolCall.command ?? "")
-        case "volume":
+        case .volume:
             return parseSystemAdjustmentPayload(
                 [
                     toolCall.direction,
@@ -1219,7 +1494,7 @@ enum PaceActionTagParser {
                 .compactMap { $0 }
                 .joined(separator: ":")
             ).map { .adjustVolume($0) }
-        case "brightness":
+        case .brightness:
             return parseSystemAdjustmentPayload(
                 [
                     toolCall.direction,
@@ -1228,12 +1503,22 @@ enum PaceActionTagParser {
                 .compactMap { $0 }
                 .joined(separator: ":")
             ).map { .adjustBrightness($0) }
-        case "calendar", "calendar_events", "list_calendar":
+        case .calendar:
             return parseCalendarPayload(toolCall.range ?? "today")
-        case "reminder", "create_reminder":
+        case .reminder:
             return parseReminderPayload(toolCall.title ?? toolCall.text ?? "")
-        default:
-            return nil
+        case .finder:
+            return parseFinderToolCall(toolCall)
+        case .notes:
+            return parseNoteToolCall(toolCall)
+        case .mail:
+            return parseMailToolCall(toolCall)
+        case .things:
+            return parseThingsToolCall(toolCall)
+        case .shortcuts:
+            return parseShortcutToolCall(toolCall)
+        case .messages:
+            return parseMessagesToolCall(toolCall)
         }
     }
 
@@ -1381,6 +1666,75 @@ enum PaceActionTagParser {
         let reminderTitle = payload.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reminderTitle.isEmpty else { return nil }
         return .createReminder(PaceReminderRequest(title: reminderTitle, notes: nil))
+    }
+
+    private static func parseFinderToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let path = (toolCall.path ?? toolCall.text ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+
+        let normalizedAction = (toolCall.action ?? "open")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let finderAction: PaceFinderAction = normalizedAction == "reveal" ? .reveal : .open
+
+        return .finder(PaceFinderRequest(path: path, action: finderAction))
+    }
+
+    private static func parseNoteToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let title = (toolCall.title ?? toolCall.name ?? "Pace note")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = (toolCall.body ?? toolCall.text ?? toolCall.notes ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty || !body.isEmpty else { return nil }
+
+        return .createNote(PaceNoteRequest(
+            title: title.isEmpty ? "Pace note" : title,
+            body: body
+        ))
+    }
+
+    private static func parseMailToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let recipients = (toolCall.to ?? toolCall.recipient ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let subject = (toolCall.subject ?? toolCall.title ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = (toolCall.body ?? toolCall.text ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !subject.isEmpty || !body.isEmpty || !recipients.isEmpty else { return nil }
+
+        return .composeMail(PaceMailDraft(
+            recipients: recipients,
+            subject: subject.isEmpty ? "Untitled" : subject,
+            body: body
+        ))
+    }
+
+    private static func parseThingsToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let title = (toolCall.title ?? toolCall.text ?? toolCall.name ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        return .createThingsToDo(PaceThingsToDoRequest(title: title, notes: toolCall.notes))
+    }
+
+    private static func parseShortcutToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let shortcutName = (toolCall.name ?? toolCall.title ?? toolCall.command ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !shortcutName.isEmpty else { return nil }
+        return .runShortcut(shortcutName)
+    }
+
+    private static func parseMessagesToolCall(_ toolCall: ToolCallDTO) -> PaceParsedAction? {
+        let recipient = (toolCall.recipient ?? toolCall.to ?? toolCall.name)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = (toolCall.text ?? toolCall.body)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return .openMessages(PaceMessageRequest(
+            recipient: recipient?.isEmpty == false ? recipient : nil,
+            text: text?.isEmpty == false ? text : nil
+        ))
     }
 
     /// Parses `up`, `down`, `up:3`, `down:5` into a relative system adjustment.

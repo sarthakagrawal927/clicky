@@ -77,6 +77,49 @@ struct PaceScreenImageDifferTests {
         #expect(diff.isMeaningful)
     }
 
+    @Test func watchDetectorEmitsOnlyMeaningfulThrottledChanges() async throws {
+        let originalImageData = try makeTestImageData(
+            width: 64,
+            height: 36,
+            changedRect: nil
+        )
+        let changedImageData = try makeTestImageData(
+            width: 64,
+            height: 36,
+            changedRect: CGRect(x: 0, y: 0, width: 24, height: 24)
+        )
+
+        let configuration = PaceScreenWatchConfiguration(
+            sampleIntervalInSeconds: 1,
+            minimumSecondsBetweenEvents: 10
+        )
+        var detector = PaceScreenWatchChangeDetector(configuration: configuration)
+
+        let baselineEvents = detector.meaningfulChanges(
+            in: [makeCapture(imageData: originalImageData)],
+            now: Date(timeIntervalSince1970: 0)
+        )
+        #expect(baselineEvents.isEmpty)
+
+        let firstChangeEvents = detector.meaningfulChanges(
+            in: [makeCapture(imageData: changedImageData)],
+            now: Date(timeIntervalSince1970: 1)
+        )
+        #expect(firstChangeEvents.count == 1)
+
+        let throttledEvents = detector.meaningfulChanges(
+            in: [makeCapture(imageData: originalImageData)],
+            now: Date(timeIntervalSince1970: 2)
+        )
+        #expect(throttledEvents.isEmpty)
+
+        let laterEvents = detector.meaningfulChanges(
+            in: [makeCapture(imageData: changedImageData)],
+            now: Date(timeIntervalSince1970: 12)
+        )
+        #expect(laterEvents.count == 1)
+    }
+
     private func makeTestImageData(
         width: Int,
         height: Int,
@@ -113,5 +156,18 @@ struct PaceScreenImageDifferTests {
         }
 
         return try #require(bitmap.representation(using: .png, properties: [:]))
+    }
+
+    private func makeCapture(imageData: Data) -> CompanionScreenCapture {
+        CompanionScreenCapture(
+            imageData: imageData,
+            label: "test screen",
+            isCursorScreen: true,
+            displayWidthInPoints: 64,
+            displayHeightInPoints: 36,
+            displayFrame: CGRect(x: 0, y: 0, width: 64, height: 36),
+            screenshotWidthInPixels: 64,
+            screenshotHeightInPixels: 36
+        )
     }
 }

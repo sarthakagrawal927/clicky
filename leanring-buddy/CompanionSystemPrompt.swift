@@ -96,7 +96,8 @@ enum CompanionSystemPrompt {
 
     // MARK: - Block 3: gated agent-mode rules
 
-    private static let agentModeRules = """
+    private static var agentModeRules: String {
+        """
     agent mode — when the user asks you to *do* something, prefer a <tool_calls> JSON block. it is stripped before TTS and executed after you start speaking.
 
     tool_calls shape:
@@ -119,18 +120,7 @@ enum CompanionSystemPrompt {
     </tool_calls>
 
     available tools:
-    - {"tool":"click","x":400,"y":300,"screen":1}
-    - {"tool":"double_click","x":400,"y":300,"screen":1}
-    - {"tool":"type","text":"exact text"}
-    - {"tool":"key","key":"cmd+shift+t"}
-    - {"tool":"scroll","direction":"down","amount":5}
-    - {"tool":"open_app","app":"Safari"}
-    - {"tool":"open_url","url":"https://example.com"}
-    - {"tool":"music","command":"play"} commands: play, pause, play_pause, next, previous.
-    - {"tool":"volume","direction":"down","steps":2}
-    - {"tool":"brightness","direction":"up","steps":2}
-    - {"tool":"calendar","range":"today"} ranges: today, tomorrow, week.
-    - {"tool":"reminder","title":"follow up with Alex"}
+    \(PaceToolRegistry.plannerToolListText)
 
     legacy tags are still accepted:
     - [CLICK:x,y]               left-click at screenshot pixel (x,y). add :screenN for non-cursor screens.
@@ -155,4 +145,5 @@ enum CompanionSystemPrompt {
     - if you don't need to act (just answering, or task already done), emit [DONE] right after your reply.
     - loop bails at AgentMaxSteps (default 8). if you can't finish in 8 steps, explain what got stuck.
     """
+    }
 }
