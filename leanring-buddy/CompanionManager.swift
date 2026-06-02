@@ -330,26 +330,31 @@ final class CompanionManager: ObservableObject {
     }
 
     private func requestUserApprovalForActionPlan(_ actionExecutionPlan: PaceActionExecutionPlan) -> Bool {
-        guard requiresActionApproval else { return true }
-
-        let approvalSummary = actionExecutionPlan.approvalSummary
-        guard !approvalSummary.isEmpty else { return true }
+        let approvalRequest = PaceActionApprovalRequest(
+            approvalSummary: actionExecutionPlan.approvalSummary,
+            requiresActionApproval: requiresActionApproval
+        )
+        guard let approvalRequest else {
+            return PaceActionApprovalPolicy.shouldExecuteActions(
+                request: nil,
+                decision: .allowOnce
+            )
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Approve Pace actions?"
-        alert.informativeText = """
-        Pace wants to control your Mac:
-
-        \(approvalSummary)
-
-        Only approve this if it matches what you asked for.
-        """
+        alert.messageText = approvalRequest.messageText
+        alert.informativeText = approvalRequest.informativeText
         alert.addButton(withTitle: "Allow Once")
         alert.addButton(withTitle: "Cancel")
 
         NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
+        let approvalDecision: PaceActionApprovalDecision =
+            alert.runModal() == .alertFirstButtonReturn ? .allowOnce : .cancel
+        return PaceActionApprovalPolicy.shouldExecuteActions(
+            request: approvalRequest,
+            decision: approvalDecision
+        )
     }
 
     /// Pace skips the upstream first-run flow entirely — no welcome video,

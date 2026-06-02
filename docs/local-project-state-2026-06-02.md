@@ -31,6 +31,8 @@ The latest local `main` includes:
 - First-pass Apple app tools: Finder, Notes, Mail drafts, Things, Shortcuts,
   and Messages opening.
 - Action approval toggle and popup before local tools control the Mac.
+- Pure action-approval policy tests for approval request creation, allow-once,
+  and cancellation.
 - Screen image diffing plus explicit watch-mode controller and panel toggle for
   meaningful change events.
 - Explicit watch-mode voice commands for "watch my screen" and "stop watching".
@@ -47,11 +49,13 @@ The latest local `main` includes:
   passed.
 - `git diff --check` passed.
 - Xcode build via AppleScript succeeded before the local merge.
-- Xcode test via AppleScript passed 112 tests after the stale test-target signing
+- Xcode test via AppleScript passed 117 tests after the stale test-target signing
   team was aligned with the app target.
 - Latest Xcode result has no `Info.plist` resource warning and no watch-command
   actor-isolation warnings. Remaining warnings are the known Swift 6 concurrency
   warnings called out in `AGENTS.md`.
+- LM Studio was not reachable at `http://localhost:1234/v1` during the latest
+  roadmap audit, so full planner/VLM runtime smoke tests remain pending.
 
 ## Still Needs Manual Verification
 

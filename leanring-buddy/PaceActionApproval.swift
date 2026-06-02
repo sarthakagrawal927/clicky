@@ -1,0 +1,53 @@
+//
+//  PaceActionApproval.swift
+//  leanring-buddy
+//
+//  Pure approval-gate helpers. CompanionManager owns the actual NSAlert UI;
+//  this file keeps the allow/cancel contract testable without controlling the
+//  user's Mac during unit tests.
+//
+
+import Foundation
+
+nonisolated enum PaceActionApprovalDecision: Equatable {
+    case allowOnce
+    case cancel
+}
+
+nonisolated struct PaceActionApprovalRequest: Equatable {
+    let approvalSummary: String
+
+    init?(approvalSummary: String, requiresActionApproval: Bool) {
+        let trimmedApprovalSummary = approvalSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard requiresActionApproval, !trimmedApprovalSummary.isEmpty else {
+            return nil
+        }
+        self.approvalSummary = trimmedApprovalSummary
+    }
+
+    var messageText: String {
+        "Approve Pace actions?"
+    }
+
+    var informativeText: String {
+        """
+        Pace wants to control your Mac:
+
+        \(approvalSummary)
+
+        Only approve this if it matches what you asked for.
+        """
+    }
+}
+
+nonisolated enum PaceActionApprovalPolicy {
+    static func shouldExecuteActions(
+        request: PaceActionApprovalRequest?,
+        decision: PaceActionApprovalDecision
+    ) -> Bool {
+        guard request != nil else {
+            return true
+        }
+        return decision == .allowOnce
+    }
+}

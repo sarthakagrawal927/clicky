@@ -5,13 +5,16 @@ ship MCP integrations.
 
 ## Priority 1: Approval And Safety
 
-Status: implemented; Xcode suite passing, manual runtime verification still needed.
+Status: implemented; Xcode suite passing, LM Studio/manual runtime verification still needed.
 
 - Ask before executing local tool calls.
 - Keep approval default-on.
 - Add clearer risk labels for actions: read-only, app/system mutation,
   input injection, and destructive.
 - Keep `EnableActions` as the hard kill switch.
+- Approval popup copy and allow/cancel policy are covered by pure unit tests;
+  a full popup smoke still requires a planner-emitted tool call in the running
+  app.
 
 ## Priority 2: Typed Tool Registry
 
@@ -68,5 +71,8 @@ Status: implemented for unit/build coverage; manual runtime smoke coverage still
 - Image-diff tests cover watch-mode change throttling.
 - Intent tests cover the route mapping.
 - Watch-mode command tests cover explicit start/stop routing.
-- Latest Xcode test run passed 112 tests after local test-target signing cleanup.
-- Still needed: physical smoke tests for approval prompts and action cancellation.
+- Approval tests cover default-on request creation and cancellation blocking
+  action execution.
+- Latest Xcode test run passed 117 tests after local test-target signing cleanup.
+- Still needed: physical smoke tests for approval prompts and action cancellation
+  with LM Studio running.
