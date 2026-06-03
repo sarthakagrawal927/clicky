@@ -200,22 +200,35 @@ enum PaceMCPServerRegistry {
 }
 
 struct PaceMCPStdioClient {
-    private let serverConfigurations: [String: PaceMCPServerConfiguration]
+    private let serverConfigurationsProvider: () -> [String: PaceMCPServerConfiguration]
     private let requestTimeoutInSeconds: TimeInterval
 
     init(
-        serverConfigurations: [String: PaceMCPServerConfiguration] = PaceMCPServerRegistry.loadConfiguredServers(),
+        serverConfigurations: [String: PaceMCPServerConfiguration]? = nil,
         requestTimeoutInSeconds: TimeInterval = 20
     ) {
-        self.serverConfigurations = serverConfigurations
+        if let serverConfigurations {
+            self.serverConfigurationsProvider = { serverConfigurations }
+        } else {
+            self.serverConfigurationsProvider = PaceMCPServerRegistry.loadConfiguredServers
+        }
+        self.requestTimeoutInSeconds = requestTimeoutInSeconds
+    }
+
+    init(
+        serverConfigurationsProvider: @escaping () -> [String: PaceMCPServerConfiguration],
+        requestTimeoutInSeconds: TimeInterval = 20
+    ) {
+        self.serverConfigurationsProvider = serverConfigurationsProvider
         self.requestTimeoutInSeconds = requestTimeoutInSeconds
     }
 
     var configuredServerNames: [String] {
-        serverConfigurations.keys.sorted()
+        serverConfigurationsProvider().keys.sorted()
     }
 
     func callTool(_ toolCall: PaceMCPToolCall) async throws -> String {
+        let serverConfigurations = serverConfigurationsProvider()
         guard let serverConfiguration = serverConfigurations[toolCall.serverName] else {
             throw PaceMCPClientError.serverNotConfigured(toolCall.serverName)
         }

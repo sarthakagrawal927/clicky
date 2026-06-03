@@ -73,4 +73,26 @@ struct PaceActionExecutorDryRunTests {
 
         #expect(multiActionFeedback == "Opened app: Notes, plus 1 more action result.")
     }
+
+    @Test func mcpClientRefreshesConfiguredServerNamesFromProvider() async throws {
+        final class MutableMCPConfigurationBox {
+            var serverConfigurations: [String: PaceMCPServerConfiguration] = [:]
+        }
+
+        let configurationBox = MutableMCPConfigurationBox()
+        let client = PaceMCPStdioClient(
+            serverConfigurationsProvider: {
+                configurationBox.serverConfigurations
+            },
+            requestTimeoutInSeconds: 1
+        )
+
+        #expect(client.configuredServerNames == [])
+
+        configurationBox.serverConfigurations = [
+            "altic": PaceMCPServerConfiguration(command: "/usr/bin/true")
+        ]
+
+        #expect(client.configuredServerNames == ["altic"])
+    }
 }
