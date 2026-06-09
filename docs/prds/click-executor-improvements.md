@@ -1,6 +1,6 @@
 ---
 name: Click executor — accuracy improvements
-status: queued — gated on tool-caller integration with TinyGPT v6 planner
+status: partial — coordinate/label top-K parser/scorer plus focused-window scoring, focused AX-tree verify/retry, recency hint scoring, and all-fail observations landed in Pace; manual ambiguity evals still queued
 owner: future Pace-repo agent
 created: 2026-06-08
 source-conversation: tinygpt session 2026-06-08 (planner v5→v6 daily-drive feedback)
@@ -29,6 +29,24 @@ This PRD describes three executor-side changes. None of them require
 re-training the planner (a separate v7 PRD will eventually update the
 planner output schema for Change 2; the executor side here can ship
 first as a backwards-compatible no-op).
+
+Implementation note, 2026-06-09: Pace now accepts coordinate and label-only
+`candidates` on `click` / `AX.press` tool calls and dispatches a
+`clickCandidates` action. Candidate arrays are accepted from both typed v10
+JSON payloads and `<tool_calls>` blocks. The selector applies the
+high-confidence shortcut, cursor-proximity scoring for coordinate candidates,
+focused-window scoring when AX exposes the active window frame, and low-weight
+recency hints (`recencyRank` / `lastSeenMsAgo` aliases) for ambiguous near-ties.
+Label-only candidates resolve against the frontmost focused window's AX tree
+and press the best exact/substring label match.
+Coordinate candidate execution also captures a local AX/window state snapshot
+before and after each click, including a bounded focused-window AX-tree
+fingerprint, waits 200ms, and retries up to the next two candidates when no
+state change is observed and `expectStateChange` is not false.
+If every tried candidate fails or produces no observable state change, the
+executor emits a `click_candidates` observation with the tried labels/locations
+so the planner can re-plan or Pace can surface a useful failure message.
+Manual ambiguity evals remain queued.
 
 ## Upstream context (TinyGPT side)
 
@@ -130,6 +148,20 @@ becomes a list-of-one) and immediately benefit when v7 lands.
 }
 ```
 
+Pace's currently implemented compatible coordinate-candidate shape:
+
+```json
+{
+  "tool": "click",
+  "screen": 1,
+  "expectStateChange": false,
+  "candidates": [
+    {"x": 100, "y": 120, "label": "Save", "confidence": 0.40},
+    {"x": 300, "y": 120, "label": "Save Draft", "confidence": 0.90}
+  ]
+}
+```
+
 ### Tiebreak algorithm
 
 Given candidates ordered by model confidence:
@@ -173,10 +205,13 @@ Each signal addresses a specific real-world ambiguity:
 
 ### Acceptance
 
-- Backwards-compat: v6 single-label JSON still works (treated as 1-element top-K)
-- Forward-compat: top-K JSON parses and scores correctly
-- Unit tests cover: focused-window tiebreak, cursor-proximity tiebreak,
-  exact-match preference, all-fail fallback
+- Backwards-compat: v6 coordinate JSON still works. Label-only candidate JSON
+  resolves through the frontmost app AX tree.
+- Forward-compat: coordinate and label top-K JSON parses and scores correctly.
+- Unit tests cover current coordinate-candidate high-confidence,
+  cursor-proximity, focused-window, and recency selection plus label-only
+  parsing and normalization. The all-fail path now emits a structured
+  observation. Real-app ambiguity verification tests remain queued.
 - Manual test on the v5-daily-drive ambiguity scenarios (the ones that
   prompted this PRD): correct element selected
 
@@ -213,7 +248,12 @@ struct ClickState {
 }
 ```
 
-If `pre == post` for all four fields, the click did nothing observable
+Current Pace implementation for coordinate candidates uses a local snapshot:
+frontmost bundle id, visible layer-0 window count, focused window title,
+focused-element fingerprint, and a bounded focused-window AX-tree fingerprint
+from role/subrole/title/description/value.
+
+If `pre == post` for all snapshot fields, the click did nothing observable
 → try candidate #2.
 
 If any field changed, the click had effect → success, exit.
@@ -222,8 +262,9 @@ If any field changed, the click had effect → success, exit.
 
 - Max 2 retries (3 total click attempts)
 - Each retry uses the next candidate from the top-K list
-- After all candidates fail, emit "click failed" via a hookable
-  callback. Pace can decide what to do (re-plan, ask user, give up).
+- After all candidates fail, emit "click failed" as a structured tool
+  observation. Pace feeds it to the next planner step and can surface it as
+  user feedback.
 
 ### Edge cases — expectNoStateChange
 
@@ -243,8 +284,9 @@ For these, the planner's v7 output should include:
 When `false`, the executor skips verification (single click attempt,
 trust it worked).
 
-For v6 backwards-compat (no `expectStateChange` field), default to
-`true` — verify by default.
+For v6 backwards-compat (no `expectStateChange` field), candidate clicks default
+to `true` and verify by default. Legacy single-coordinate clicks keep the old
+single-attempt behavior.
 
 ### How to apply
 
@@ -256,7 +298,8 @@ For v6 backwards-compat (no `expectStateChange` field), default to
 
 ### Acceptance
 
-- Behind a feature flag (default: ON)
+- Coordinate candidate clicks retry when state is unchanged. A separate feature
+  flag is still queued if real-app smoke shows a need to disable it.
 - Smoke test on Pace's existing fm-fixtures: same or better hit rate,
   no regressions
 - Manual test: known-flaky real-screen scenarios from v5 daily-drive
