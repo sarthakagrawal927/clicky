@@ -317,6 +317,77 @@ struct PaceLocalRetrievalTests {
         ))
     }
 
+    @Test func retrievalContextPolicyMatchesJournalTimePhrases() async throws {
+        #expect(PaceRetrievalContextPolicy.shouldQueryLocalContext(
+            forTranscript: "what was I doing earlier today",
+            route: .answerDirectly
+        ))
+        #expect(PaceRetrievalContextPolicy.shouldQueryLocalContext(
+            forTranscript: "what have I been working on",
+            route: .fullPipeline
+        ))
+        #expect(PaceRetrievalContextPolicy.shouldQueryLocalContext(
+            forTranscript: "how did I spend my time this afternoon",
+            route: .fullPipeline
+        ))
+    }
+
+    @Test func recordedScreenWatchObservationIsRetrievableByWhatDidIDoQuery() async throws {
+        let retriever = PaceLocalRetriever(
+            store: PaceInMemoryRetrievalStore(),
+            appliesPersistedSourcePreferences: false
+        )
+        retriever.recordScreenWatchObservation(
+            screenLabel: "primary focus",
+            categoryDisplayName: "major screen change",
+            frontmostApplicationName: "Xcode",
+            screenDescription: "editing CompanionManager.swift in the Pace project"
+        )
+
+        let contextBlock = retriever.localContextBlock(
+            for: PaceRetrievalQuery(text: "what did I do today in Xcode CompanionManager")
+        )
+        #expect(contextBlock?.contains("Screen watch journal") == true)
+        #expect(contextBlock?.contains("Xcode") == true)
+    }
+
+    @Test func disabledScreenWatchSourceSkipsRecording() async throws {
+        let store = PaceInMemoryRetrievalStore()
+        let retriever = PaceLocalRetriever(
+            store: store,
+            appliesPersistedSourcePreferences: false
+        )
+        retriever.setSourceEnabled(false, for: .screenWatchHistory)
+        retriever.recordScreenWatchObservation(
+            screenLabel: "primary focus",
+            categoryDisplayName: "content update",
+            frontmostApplicationName: "Safari",
+            screenDescription: nil
+        )
+        #expect(store.documents(withSource: .screenWatchHistory).isEmpty)
+    }
+
+    @Test func flushedAppUsageDocumentIsRetrievableByTimeQuery() async throws {
+        let store = PaceInMemoryRetrievalStore()
+        let retriever = PaceLocalRetriever(
+            store: store,
+            appliesPersistedSourcePreferences: false
+        )
+        var journal = retriever.rehydratedAppUsageJournal()
+        let startedAt = Date()
+        journal.recordActivation(appName: "Xcode", at: startedAt)
+        journal.recordActivation(appName: "Safari", at: startedAt.addingTimeInterval(1200))
+        let flushed_flushedDocument = journal.flush(now: startedAt.addingTimeInterval(1500))
+        let flushedDocument = try #require(flushed_flushedDocument)
+        retriever.recordAppUsageDocument(flushedDocument)
+
+        let contextBlock = retriever.localContextBlock(
+            for: PaceRetrievalQuery(text: "how did I spend my time in Xcode Safari switches")
+        )
+        #expect(contextBlock?.contains("App usage journal") == true)
+        #expect(contextBlock?.contains("Xcode") == true)
+    }
+
     @Test func fileConnectorSkipsSensitiveRootsAndLoadsAllowedTextFiles() async throws {
         let temporaryRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("pace-retrieval-tests-\(UUID().uuidString)", isDirectory: true)

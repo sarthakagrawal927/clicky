@@ -157,6 +157,15 @@ final class CompanionManager: ObservableObject {
         return retriever
     }()
 
+    private lazy var appUsageTracker: PaceAppUsageTracker? = PaceAppUsageTracker(
+        rehydratedJournal: localRetriever.rehydratedAppUsageJournal(),
+        onFlushedDocument: { [weak self] flushedDocument in
+            guard let self else { return }
+            self.localRetriever.recordAppUsageDocument(flushedDocument)
+            self.refreshLocalRetrievalPublishedState()
+        }
+    )
+
     private lazy var calendarRetrievalConnector: PaceCalendarRetrievalConnector = {
         return PaceCalendarRetrievalConnector(eventStore: permissionEventStore)
     }()
@@ -413,6 +422,11 @@ final class CompanionManager: ObservableObject {
         latestWatchModeSummary = summary
         print("👀 Watch mode: \(summary) meanDelta=\(String(format: "%.2f", event.diff.meanPixelDelta)) changedRatio=\(String(format: "%.3f", event.diff.changedPixelRatio))")
 
+        // Journal before the idle guard — that guard only exists to avoid
+        // speaking over an in-flight turn, but history should be captured
+        // regardless of what the voice pipeline is doing.
+        recordWatchModeEventInJournal(event)
+
         guard voiceState == .idle else { return }
 
         responseOverlayManager.showOverlayAndBeginStreaming()
@@ -427,6 +441,31 @@ final class CompanionManager: ObservableObject {
             responseOverlayManager.finishStreaming()
             voiceState = .idle
         }
+    }
+
+    private func recordWatchModeEventInJournal(_ event: PaceScreenWatchEvent) {
+        // Frontmost app name is a cheap synchronous NSWorkspace read — the
+        // same source the ASR contextual-phrase builder uses.
+        let frontmostApplicationName = NSWorkspace.shared.frontmostApplication?.localizedName
+        // Reuse the per-screen VLM cache only while it is fresh enough to
+        // still describe roughly what the user is looking at. Never run the
+        // VLM from here — journaling must stay free.
+        var freshCachedScreenDescription: String?
+        if let cachedScreenAnalysis = perScreenAnalysisCache[event.screenLabel],
+           event.detectedAt.timeIntervalSince(cachedScreenAnalysis.capturedAt) <= 120 {
+            let cachedDescription = cachedScreenAnalysis.analysis.description
+            if !cachedDescription.isEmpty {
+                freshCachedScreenDescription = cachedDescription
+            }
+        }
+        localRetriever.recordScreenWatchObservation(
+            screenLabel: event.screenLabel,
+            categoryDisplayName: event.category.displayName,
+            frontmostApplicationName: frontmostApplicationName,
+            screenDescription: freshCachedScreenDescription,
+            now: event.detectedAt
+        )
+        refreshLocalRetrievalPublishedState()
     }
 
     private func requestUserApprovalForActionPlan(
@@ -681,6 +720,9 @@ final class CompanionManager: ObservableObject {
         localRetriever.setSourceEnabled(isEnabled, for: source)
         refreshLocalRetrievalPublishedState()
 
+        if source == .appUsageHistory, !isEnabled {
+            appUsageTracker?.stop()
+        }
         guard isEnabled else { return }
         switch source {
         case .calendar:
@@ -701,8 +743,12 @@ final class CompanionManager: ObservableObject {
             refreshLocalRetrievalPublishedState()
         case .file:
             refreshFileRetrievalDocumentsIfAllowed(force: true)
-        case .paceHistory:
+        case .paceHistory, .screenWatchHistory:
+            // Both are recorded passively as turns/watch events happen —
+            // nothing to refresh on re-enable.
             break
+        case .appUsageHistory:
+            appUsageTracker?.start()
         }
     }
 
@@ -1133,6 +1179,13 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
         }
+
+        // Foreground app-usage journaling: permission-free NSWorkspace
+        // observation that powers "how did I spend my time?" answers.
+        // Honors the per-source retrieval toggle like every other source.
+        if localRetriever.isSourceEnabled(.appUsageHistory) {
+            appUsageTracker?.start()
+        }
     }
 
     func clearDetectedElementLocation() {
@@ -1142,6 +1195,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        appUsageTracker?.stop()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()

@@ -17,6 +17,8 @@ enum PaceRetrievalSource: String, CaseIterable, Codable, Equatable {
     case contacts
     case competitiveResearch
     case paceHistory
+    case screenWatchHistory
+    case appUsageHistory
     case localPreference
 
     var displayName: String {
@@ -37,6 +39,10 @@ enum PaceRetrievalSource: String, CaseIterable, Codable, Equatable {
             return "Competitive research"
         case .paceHistory:
             return "Pace history"
+        case .screenWatchHistory:
+            return "Screen watch journal"
+        case .appUsageHistory:
+            return "App usage journal"
         case .localPreference:
             return "Preference"
         }
@@ -137,6 +143,7 @@ struct PaceRetrievalSourceStatus: Equatable {
 protocol PaceRetrievalStore: AnyObject {
     func reset()
     func upsertDocuments(_ documents: [PaceRetrievalDocument])
+    func documents(withSource source: PaceRetrievalSource) -> [PaceRetrievalDocument]
     func removeDocuments(withSource source: PaceRetrievalSource)
     func updateSourceStatus(_ status: PaceRetrievalSourceStatus)
     func setSourceEnabled(_ isEnabled: Bool, for source: PaceRetrievalSource)
@@ -313,7 +320,8 @@ enum PaceRetrievalContextPolicy {
         "from that", "from the latest", "from yesterday", "i edited",
         "i was editing", "latest", "last email", "last message", "last note",
         "previous", "recent", "said about", "that email", "that note",
-        "this morning", "using my", "we discussed", "what did", "what was",
+        "earlier today", "my time", "this morning", "using my",
+        "we discussed", "what did", "what have i been", "what was",
         "where is", "yesterday"
     ]
 
@@ -424,6 +432,10 @@ final class PaceInMemoryRetrievalStore: PaceRetrievalStore {
 
         refreshSourceStatuses()
         persistDocuments()
+    }
+
+    func documents(withSource source: PaceRetrievalSource) -> [PaceRetrievalDocument] {
+        documentsById.values.filter { $0.source == source }
     }
 
     func removeDocuments(withSource source: PaceRetrievalSource) {
@@ -809,6 +821,7 @@ final class PaceLocalRetriever: PaceRetriever {
     private let store: PaceRetrievalStore
     private let maximumContextCharacters: Int
     private(set) var lastQueryDurationMilliseconds: Int?
+    private var screenWatchJournal: PaceScreenWatchJournal?
 
     init(
         store: PaceRetrievalStore? = nil,
@@ -878,6 +891,61 @@ final class PaceLocalRetriever: PaceRetriever {
     func refreshCompetitiveResearchDocuments() {
         store.removeDocuments(withSource: .competitiveResearch)
         store.upsertDocuments(PaceCompetitiveResearchSeeds.documents)
+    }
+
+    /// Journals a watch-mode screen event so "what did I do today?" style
+    /// questions can be answered from local history. Recording is free of
+    /// model calls — the screen description, when present, comes from the
+    /// caller's already-cached analysis.
+    func recordScreenWatchObservation(
+        screenLabel: String,
+        categoryDisplayName: String,
+        frontmostApplicationName: String?,
+        screenDescription: String?,
+        now: Date = Date()
+    ) {
+        guard isSourceEnabled(.screenWatchHistory) else { return }
+        var journal = screenWatchJournal ?? rehydratedScreenWatchJournal(now: now)
+        let changedDocument = journal.record(PaceScreenWatchJournalEntry(
+            recordedAt: now,
+            screenLabel: screenLabel,
+            categoryDisplayName: categoryDisplayName,
+            frontmostApplicationName: frontmostApplicationName,
+            screenDescription: screenDescription
+        ))
+        screenWatchJournal = journal
+        if let changedDocument {
+            store.upsertDocuments([changedDocument])
+        }
+    }
+
+    /// Rebuilds the in-memory journal from persisted documents on the first
+    /// event after launch — without this, the first post-restart event would
+    /// upsert a same-id day bucket and clobber the earlier history. Also the
+    /// single point where the retention window is enforced.
+    private func rehydratedScreenWatchJournal(now: Date) -> PaceScreenWatchJournal {
+        var journal = PaceScreenWatchJournal(
+            rehydratingFrom: store.documents(withSource: .screenWatchHistory),
+            now: now
+        )
+        replaceDocuments(journal.allDocuments(now: now), forSource: .screenWatchHistory)
+        return journal
+    }
+
+    /// Rebuilds the app-usage journal from persisted documents and enforces
+    /// its retention window. Called once when the tracker starts.
+    func rehydratedAppUsageJournal(now: Date = Date()) -> PaceAppUsageJournal {
+        var journal = PaceAppUsageJournal(
+            rehydratingFrom: store.documents(withSource: .appUsageHistory),
+            now: now
+        )
+        replaceDocuments(journal.allDocuments(now: now), forSource: .appUsageHistory)
+        return journal
+    }
+
+    func recordAppUsageDocument(_ document: PaceRetrievalDocument) {
+        guard isSourceEnabled(.appUsageHistory) else { return }
+        store.upsertDocuments([document])
     }
 
     func recordPaceHistory(
