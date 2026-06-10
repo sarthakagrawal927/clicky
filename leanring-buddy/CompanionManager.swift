@@ -1814,75 +1814,14 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline (plan-act-observe loop)
 
-    /// Picks a canned reply for chitchat turns the intent classifier
-    /// confidently identified. Hardcoded responses are intentionally
-    /// short and varied so back-to-back greetings don't feel scripted.
-    /// Returns a single utterance string ready for TTS — no further
-    /// processing needed.
-    private func cannedChitchatResponse(for transcript: String) -> String {
-        let lowercased = transcript.lowercased()
-        if lowercased.contains("thank") || lowercased.contains("appreciate") {
-            return ["you got it", "anytime", "happy to help", "no problem"].randomElement() ?? "you got it"
-        }
-        if lowercased.contains("bye") || lowercased.contains("later") || lowercased.contains("see you") {
-            return ["catch you later", "see you", "talk soon"].randomElement() ?? "see you"
-        }
-        if lowercased.contains("hear me") || lowercased.contains("are you there")
-            || lowercased.contains("are you listening") || lowercased.contains("you listening")
-            || lowercased.contains("can you understand me")
-            || lowercased.contains("mic check") || lowercased.contains("test test")
-            || lowercased.contains("is this on") || lowercased.contains("is it working") {
-            return ["yes, i can hear you.", "loud and clear.", "yep, hearing you fine."].randomElement() ?? "yes, i can hear you."
-        }
-        if lowercased.contains("how are you") || lowercased.contains("how's it going")
-            || lowercased.contains("how is it going") || lowercased.contains("how are things")
-            || lowercased.contains("how's everything") || lowercased.contains("how's your day")
-            || lowercased.contains("what's up") {
-            return ["doing great, what's up?", "all good — what can I do?", "i'm good, you?"].randomElement() ?? "doing great"
-        }
-        if lowercased.contains("good morning") {
-            return "morning! what's the plan?"
-        }
-        if lowercased.contains("good evening") {
-            return "evening! what's up?"
-        }
-        if lowercased.contains("hi") || lowercased.contains("hello") || lowercased.contains("hey") {
-            return ["hey", "hey there", "hi! what's on your mind?"].randomElement() ?? "hey"
-        }
-        // Generic acknowledgement for "ok cool", "got it", "perfect", "nice", etc.
-        return ["got it", "okay", "sounds good"].randomElement() ?? "okay"
-    }
-
-    /// Short-circuit turn handler for the chitchat intent. Skips VLM,
-    /// planner, and the agent loop entirely. Dispatches a canned
-    /// response straight to TTS and the overlay bubble. Used by the
-    /// intent-classifier fast-path in `sendTranscriptToPlannerWithScreenshot`.
+    /// Chitchat short-circuit: skips screen capture and the VLM, but lets
+    /// the on-device LLM write the actual reply. The classifier still
+    /// decides "this is small talk" cheaply; reply generation goes through
+    /// the model so the answer fits the turn ("yes, i can hear you" for a
+    /// mic check; "morning, what's the plan" for a greeting; etc.) instead
+    /// of falling out of a hand-rolled if/contains chain.
     private func handleChitchatFastPath(transcript: String) {
-        let cannedReply = cannedChitchatResponse(for: transcript)
-        currentTurnHUDState = .done("quick reply")
-
-        // Append to conversation history so multi-turn context still sees
-        // the exchange — important so a follow-up question after a
-        // greeting still reads naturally to the planner.
-        recordConversationTurn(userTranscript: transcript, assistantResponse: cannedReply)
-
-        responseOverlayManager.showOverlayAndBeginStreaming()
-        responseOverlayManager.updateStreamingText(cannedReply)
-
-        currentResponseTask = Task {
-            voiceState = .responding
-            await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: cannedReply)
-            // Wait for TTS to drain before returning to idle so the
-            // walking avatar's mouth animation matches.
-            while ttsClient.isPlaying {
-                try? await Task.sleep(nanoseconds: 80_000_000)
-            }
-            responseOverlayManager.finishStreaming()
-            voiceState = .idle
-            if isWalkingAvatarEnabled {
-                avatarOverlayManager?.show()
-            }
-        }
+        handleTextOnlyPlannerFastPath(transcript: transcript)
     }
 
     private func handleClarificationTurn(

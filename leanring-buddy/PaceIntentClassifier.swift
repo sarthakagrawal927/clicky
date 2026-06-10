@@ -152,21 +152,17 @@ final class PaceIntentClassifier {
         "yo pace",
     ]
 
-    /// "Can you hear me?" and similar mic-check questions need to confirm
-    /// HEARING, not describe the screen. The full pipeline would feed the
-    /// screen to the planner and answer about whatever it sees.
-    private static let audioConfirmationPhrases: [String] = [
-        "can you hear me", "do you hear me", "did you hear me",
-        "are you there", "are you listening", "you listening",
-        "can you understand me", "mic check", "test test",
-        "is this on", "is it working",
-    ]
-
+    /// Conversational utterances that should answer about the user/Pace,
+    /// not the screen. These route to the chitchat fast-path — which now
+    /// just calls the text-only planner — so the LLM writes the reply
+    /// instead of a hand-rolled lookup table.
     private static let chitchatStarters: [String] = [
         "hi pace", "hello pace", "hey there", "hi there", "good morning",
         "good evening", "good afternoon", "what's up", "how are you",
         "how's it going", "how is it going", "how are things",
         "how's everything", "how's your day",
+        "can you hear me", "do you hear me", "are you there",
+        "are you listening", "mic check", "test test",
         "thanks", "thank you", "appreciate it", "you're great",
         "you're awesome", "good job", "nice work", "bye for now",
         "talk later", "catch you later", "later pace", "see you",
@@ -259,14 +255,6 @@ final class PaceIntentClassifier {
         // dictation regularly appends "?" or "!" to greetings.
         let punctuationTrimmedTranscript = lowercaseTranscript
             .trimmingCharacters(in: CharacterSet(charactersIn: " .!?"))
-        // Audio-confirmation questions answer ABOUT HEARING, not about the
-        // screen — check before any other route.
-        for audioConfirmationPhrase in Self.audioConfirmationPhrases {
-            if punctuationTrimmedTranscript.contains(audioConfirmationPhrase) {
-                return PaceIntentPrediction(intent: .chitchat, confidence: 0.95)
-            }
-        }
-
         for chitchatPhrase in Self.chitchatStarters {
             if punctuationTrimmedTranscript == chitchatPhrase
                 || lowercaseTranscript.hasPrefix(chitchatPhrase + " ") {
