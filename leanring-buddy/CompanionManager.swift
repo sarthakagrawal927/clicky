@@ -1049,6 +1049,59 @@ final class CompanionManager: ObservableObject {
         globalPushToTalkShortcutMonitor.simulateShortcutReleased()
     }
 
+    /// Entry point for the pace://listen deeplink. Folds into the same
+    /// PTT pipeline as an avatar tap, including the transcription-model
+    /// readiness rejection and overlay anchoring. Start-only — a deeplink
+    /// must never stop or interrupt an in-flight turn.
+    func beginListeningFromDeepLink() {
+        guard voiceState == .idle else {
+            print("🔗 Deeplink listen ignored — turn in flight (\(voiceState))")
+            return
+        }
+        currentDictationTrigger = .keyboard
+        globalPushToTalkShortcutMonitor.simulateShortcutPressed()
+    }
+
+    /// Entry point for the pace://chat deeplink. The transcript is treated
+    /// exactly like a spoken turn: same intent classification, fast paths,
+    /// retrieval injection, and — critically — the same action-approval
+    /// policy, so a deeplink can do nothing the user's own voice couldn't.
+    func submitChatTranscriptFromDeepLink(_ transcript: String) {
+        guard voiceState == .idle else {
+            print("🔗 Deeplink chat ignored — turn in flight (\(voiceState))")
+            return
+        }
+        print("🔗 Deeplink chat transcript: \(transcript)")
+
+        currentResponseTask?.cancel()
+        currentResponseTask = nil
+        ttsClient.stopPlayback()
+        streamingSentenceTTSPipeline.resetForNewTurn()
+        clearDetectedElementLocation()
+
+        // Transient cursor mode: surface the overlay for the duration of
+        // this turn, mirroring the PTT press path.
+        if !isPaceCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        lastTranscript = transcript
+        PaceAnalytics.trackUserMessageSent(transcript: transcript)
+        currentTurnHUDState = .understanding("classifying intent")
+        responseOverlayManager.setAnchor(.belowRightOfCursor)
+        responseOverlayManager.showOverlayAndBeginStreaming()
+        responseOverlayManager.updateStreamingText(transcript)
+
+        // Stamp intent-commit now so TTFSW latency logging stays meaningful
+        // for deeplink turns (there is no PTT release to stamp it).
+        streamingSentenceTTSPipeline.markIntentCommitted()
+        startScreenContextPrewarmIfEnabled()
+        voiceState = .processing
+        sendTranscriptToPlannerWithScreenshot(transcript: transcript)
+    }
+
     func start() {
         refreshAllPermissions()
         print("🔑 Pace start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")

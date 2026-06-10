@@ -33,6 +33,12 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var runtimeSmokeTestHooks: PaceRuntimeSmokeTestHooks?
     private let companionManager = CompanionManager()
 
+    // A cold launch via URL delivers application(_:open:) before
+    // applicationDidFinishLaunching has built the managers — buffer the
+    // commands and drain them once launch completes.
+    private var pendingDeepLinkCommands: [PaceDeepLinkCommand] = []
+    private var hasFinishedLaunching = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("🎯 Pace: Starting...")
         print("🎯 Pace: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
@@ -81,6 +87,41 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             menuBarPanelManager.showPanelOnLaunch()
         }
         registerAsLoginItemIfNeeded()
+
+        hasFinishedLaunching = true
+        let bufferedDeepLinkCommands = pendingDeepLinkCommands
+        pendingDeepLinkCommands = []
+        for deepLinkCommand in bufferedDeepLinkCommands {
+            executeDeepLinkCommand(deepLinkCommand)
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            guard let deepLinkCommand = PaceDeepLinkParser.parse(url) else {
+                print("🔗 Pace: ignoring unrecognized deeplink \(url.absoluteString)")
+                continue
+            }
+            print("🔗 Pace: deeplink \(url.absoluteString)")
+            if hasFinishedLaunching {
+                executeDeepLinkCommand(deepLinkCommand)
+            } else {
+                pendingDeepLinkCommands.append(deepLinkCommand)
+            }
+        }
+    }
+
+    private func executeDeepLinkCommand(_ command: PaceDeepLinkCommand) {
+        switch command {
+        case .showPanel:
+            menuBarPanelManager?.showPanelFromDeepLink()
+        case .setWatchMode(let enabled):
+            companionManager.setWatchModeEnabled(enabled)
+        case .startListening:
+            companionManager.beginListeningFromDeepLink()
+        case .sendChatMessage(let text):
+            companionManager.submitChatTranscriptFromDeepLink(text)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
