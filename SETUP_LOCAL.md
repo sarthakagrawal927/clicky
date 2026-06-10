@@ -150,6 +150,37 @@ Safety:
 - Use stdio servers for local Mac automation; avoid exposing local MCP servers
   over HTTP unless they bind only to localhost and have proper auth.
 
+### Verifying your MCP setup end-to-end
+
+You can confirm Pace's full MCP round trip (initialize →
+notifications/initialized → tools/call → result extraction) without installing
+any real server by pointing a config entry at the in-repo fixture:
+
+```json
+{
+  "mcpServers": {
+    "fixture": {
+      "command": "python3",
+      "args": ["/absolute/path/to/pace/scripts/mcp-fixture-server.py"]
+    }
+  }
+}
+```
+
+Then ask Pace to run
+`{"tool":"mcp","server":"fixture","name":"echo","arguments":{"text":"hello"}}`,
+or run the automated check: the `PaceMCPClientIntegrationTests` suite in
+`leanring-buddyTests` spawns the fixture as a real child process and asserts
+echo, error, and timeout behavior.
+
+Wire-format contract: Pace speaks **newline-delimited JSON-RPC** over stdio —
+one JSON object per line. Servers that require LSP-style `Content-Length`
+header framing are not supported. Most OSS MCP servers (the
+`@modelcontextprotocol/*` family, `uvx mcp-server-*`) use newline framing and
+work as-is; `mcp-servers.example.json` lists curated starting points
+(filesystem, fetch, github, applescript) — each MCP server you configure is a
+new app connector Pace gets for free.
+
 The notch panel has a gear button that opens the full Pace Settings window.
 Use that window to create/reveal the MCP config file, inspect configured server
 names, manage permissions, tune quick preferences, check voice quality, and

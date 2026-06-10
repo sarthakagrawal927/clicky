@@ -313,8 +313,8 @@ enum PaceRetrievalContextPolicy {
         "from that", "from the latest", "from yesterday", "i edited",
         "i was editing", "latest", "last email", "last message", "last note",
         "previous", "recent", "said about", "that email", "that note",
-        "this morning", "we discussed", "what did", "what was", "where is",
-        "yesterday"
+        "this morning", "using my", "we discussed", "what did", "what was",
+        "where is", "yesterday"
     ]
 
     private static let localPreferencePhrases: [String] = [

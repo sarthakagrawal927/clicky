@@ -164,7 +164,12 @@ struct PaceLocalRetrievalTests {
 
         let reloadedStore = PaceInMemoryRetrievalStore(persistenceURL: persistenceURL)
         #expect(reloadedStore.search(PaceRetrievalQuery(text: "Friday")).isEmpty)
-        #expect(reloadedStore.search(PaceRetrievalQuery(text: "privacy local")).first?.source == .notes)
+        // Built-in competitive-research seeds also rank for generic
+        // privacy/local terms, so assert source membership instead of
+        // first-place ranking.
+        let privacyMatches = reloadedStore.search(PaceRetrievalQuery(text: "privacy local"))
+        #expect(privacyMatches.contains { $0.source == .notes })
+        #expect(!privacyMatches.contains { $0.source == .calendar })
     }
 
     @Test func localContextBlockCapsItemsAndCharacters() async throws {
@@ -222,16 +227,21 @@ struct PaceLocalRetrievalTests {
     }
 
     @Test func builtInCompetitiveResearchIncludesProjectMinimi() async throws {
+        // Wider context/snippet limits than the runtime defaults: this test
+        // asserts on facts deep inside the Minimi seed chunks ("Gemini",
+        // "cloud embeddings"), and the built-in corpus also seeds Dayflow and
+        // voice-assistant research that competes for the capped block.
         let retriever = PaceLocalRetriever(
             store: PaceInMemoryRetrievalStore(),
+            maximumContextCharacters: 2400,
             appliesPersistedSourcePreferences: false
         )
 
         let contextBlock = retriever.localContextBlock(
             for: PaceRetrievalQuery(
-                text: "how does Pace differ from Project Minimi Gemini embeddings Claude ambient memory",
-                maximumResultCount: 2,
-                maximumSnippetCharacters: 260
+                text: "Project Minimi Gemini embeddings paid plan cloud privacy gap",
+                maximumResultCount: 4,
+                maximumSnippetCharacters: 480
             )
         )
 
