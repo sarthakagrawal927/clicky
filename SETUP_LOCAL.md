@@ -107,8 +107,12 @@ preferred path for broad integrations such as Altic MCP, AirMCP, Apple MCP, or
 other OSS servers. Pace stays responsible for voice, screen context, approval,
 and action results; the MCP server owns the app-specific integration.
 
-Live config is intentionally outside the repo. The Settings window can create
-an empty config for you, or you can seed it from the checked-in example:
+Live config is intentionally outside the repo. The Settings window's
+"Create / Open" button seeds a starter config with **apple-mcp** — one stdio
+server covering Contacts, Notes, Messages, Mail, Reminders, Calendar, and
+Maps (first call downloads it via `npx -y apple-mcp`; handshake-verified
+against Pace's wire dialect). Add any other server by editing the same file,
+or seed from the checked-in example:
 
 ```bash
 mkdir -p ~/.config/pace

@@ -89,6 +89,17 @@ struct PaceMCPClientIntegrationTests {
         }
     }
 
+    @Test func starterConfigurationSeedsAppleMCPServer() throws {
+        let starterData = try #require(PaceMCPServerRegistry.starterConfigurationJSON.data(using: .utf8))
+        let decodedRoot = try JSONDecoder().decode(
+            [String: [String: PaceMCPServerConfiguration]].self,
+            from: starterData
+        )
+        let appleServerConfiguration = try #require(decodedRoot["mcpServers"]?["apple"])
+        #expect(appleServerConfiguration.command == "npx")
+        #expect(appleServerConfiguration.args == ["-y", "apple-mcp"])
+    }
+
     @Test func unconfiguredServerNameThrowsServerNotConfigured() async {
         let clientWithNoServers = PaceMCPStdioClient(serverConfigurations: [:])
         do {

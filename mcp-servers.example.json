@@ -1,5 +1,12 @@
 {
   "mcpServers": {
+    "apple": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "apple-mcp"
+      ]
+    },
     "fixture": {
       "command": "python3",
       "args": [
