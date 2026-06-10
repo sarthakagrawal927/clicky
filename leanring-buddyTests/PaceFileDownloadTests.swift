@@ -114,6 +114,48 @@ struct PaceFileDownloadTests {
         #expect(downloadRequest.suggestedFilename == "q2-report.pdf")
     }
 
+    @Test func downloadAllFilesFromALinkIsApprovalGatedAndCanNeverOverwrite() async throws {
+        // "download all files from a link": the planner can only express this
+        // as one download_file call per file — there is no crawl tool. Every
+        // such plan must require explicit approval, and repeated downloads
+        // can never clobber existing files (collision suffixes, no deletes).
+        let parseResult = PaceActionTagParser.parseActions(from: """
+        downloading the files.
+        <tool_calls>
+        [
+          [
+            {"tool":"download_file","url":"https://example.com/files/a.pdf"},
+            {"tool":"download_file","url":"https://example.com/files/b.pdf"},
+            {"tool":"download_file","url":"https://example.com/files/c.pdf"}
+          ]
+        ]
+        </tool_calls>
+        """)
+
+        #expect(parseResult.actions.count == 3)
+        #expect(parseResult.actions.allSatisfy { action in
+            if case .downloadFile = action { return true }
+            return false
+        })
+        #expect(PaceActionApprovalPolicy.requiresExplicitApproval(for: parseResult.executionPlan))
+
+        // Same filename downloaded repeatedly always lands on a fresh name.
+        var existingFilenames: Set<String> = ["report.pdf"]
+        for _ in 0..<5 {
+            let nextFilename = PaceDownloadFilenameSanitizer.collisionFreeFilename(
+                "report.pdf",
+                existingFilenames: existingFilenames
+            )
+            #expect(!existingFilenames.contains(nextFilename))
+            existingFilenames.insert(nextFilename)
+        }
+    }
+
+    @Test func registryShipsNoDestructiveTools() async throws {
+        #expect(PaceToolRegistry.localTools.allSatisfy { $0.riskLevel != .destructive })
+        #expect(PaceToolRegistry.validateLocalRegistry().isEmpty)
+    }
+
     @Test func downloadActionRequiresExplicitApproval() async throws {
         let downloadAction = PaceParsedAction.downloadFile(PaceFileDownloadRequest(
             url: URL(string: "https://example.com/report.pdf")!,

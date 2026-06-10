@@ -320,9 +320,9 @@ enum PaceRetrievalContextPolicy {
         "from that", "from the latest", "from yesterday", "i edited",
         "i was editing", "latest", "last email", "last message", "last note",
         "previous", "recent", "said about", "that email", "that note",
-        "earlier today", "my time", "this morning", "using my",
-        "we discussed", "what did", "what have i been", "what was",
-        "where is", "yesterday"
+        "did i use", "earlier today", "my time", "this morning", "using my",
+        "we discussed", "what apps", "what did", "what have i been",
+        "what was", "where is", "which apps", "yesterday"
     ]
 
     private static let localPreferencePhrases: [String] = [
@@ -970,7 +970,29 @@ final class PaceLocalRetriever: PaceRetriever {
 
     func localContextBlock(for query: PaceRetrievalQuery) -> String? {
         let retrievalStartedAt = Date()
-        let matches = store.search(query)
+        // Search a wider candidate pool, then enforce source diversity:
+        // best match per source first, remaining slots filled by score.
+        // Without this, one chatty source can monopolize the block — e.g.
+        // recent Pace turns that echo the user's exact question outrank the
+        // journal/data documents that actually hold the answer, and the
+        // planner ends up parroting its own previous reply.
+        let candidatePoolQuery = PaceRetrievalQuery(
+            text: query.text,
+            maximumResultCount: query.maximumResultCount * 3,
+            maximumSnippetCharacters: query.maximumSnippetCharacters
+        )
+        let candidateMatches = store.search(candidatePoolQuery)
+        var diverseMatches: [PaceRetrievalMatch] = []
+        var overflowMatches: [PaceRetrievalMatch] = []
+        var seenSources: Set<PaceRetrievalSource> = []
+        for candidateMatch in candidateMatches {
+            if seenSources.insert(candidateMatch.source).inserted {
+                diverseMatches.append(candidateMatch)
+            } else {
+                overflowMatches.append(candidateMatch)
+            }
+        }
+        let matches = Array((diverseMatches + overflowMatches).prefix(query.maximumResultCount))
         let retrievalDurationMilliseconds = Int(Date().timeIntervalSince(retrievalStartedAt) * 1000)
         lastQueryDurationMilliseconds = retrievalDurationMilliseconds
         let sourceCount = Set(matches.map(\.source)).count

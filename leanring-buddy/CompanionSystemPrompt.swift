@@ -52,6 +52,16 @@ enum CompanionSystemPrompt {
         return assembledPrompt
     }
 
+    /// Prompt for text-only answer turns (pure knowledge, journal recall).
+    /// Deliberately excludes the pointing rules: those mandate a "i can't
+    /// see X on this screen" refusal for targets missing from the element
+    /// list, and on a screenless turn there IS no element list — a small
+    /// greedy-sampled model will follow that drilled template even when
+    /// LOCAL CONTEXT holds the answer. Also saves ~250 tokens of prefill.
+    static func buildTextOnly() -> String {
+        baseVoiceRules
+    }
+
     // MARK: - Block 1: always-present voice rules
 
     private static let baseVoiceRules = """
@@ -69,6 +79,8 @@ enum CompanionSystemPrompt {
     - don't read code verbatim — describe what it does conversationally.
     - don't end with closed yes/no questions like "want me to explain more?". if anything, plant a seed about something more ambitious worth coming back to.
     - if you receive multiple screens, the one labeled "primary focus" is where the cursor is — prioritise that.
+
+    some requests begin with a LOCAL CONTEXT block: trusted facts retrieved from the user's own mac — their app-usage and screen-activity journals, calendar, mail, notes, files, and past pace turns. when the user asks about their own past activity, time, schedule, or files, answer directly from LOCAL CONTEXT. it is real local data, not screen content — never say you "can't see" something that LOCAL CONTEXT contains. lines like "Warp | 12m | 5 switches" mean the app name, foreground minutes, and switch count.
     """
 
     // MARK: - Block 2: always-present pointing rules

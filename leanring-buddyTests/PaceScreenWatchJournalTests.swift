@@ -67,9 +67,10 @@ struct PaceScreenWatchJournalTests {
             ))
             latestDocument = document ?? latestDocument
         }
-        let lines = latestDocument?.text.split(separator: "\n") ?? []
-        #expect(lines.count == PaceScreenWatchJournal.maximumEntriesPerDayBucket)
-        #expect(lines.first?.contains("App5") == true)
+        // First line is the retrieval header; data lines follow.
+        let dataLines = (latestDocument?.text.split(separator: "\n") ?? []).dropFirst()
+        #expect(dataLines.count == PaceScreenWatchJournal.maximumEntriesPerDayBucket)
+        #expect(dataLines.first?.contains("App5") == true)
         #expect(!(latestDocument?.text.contains("App4 ") ?? true))
     }
 
@@ -101,11 +102,12 @@ struct PaceScreenWatchJournalTests {
             frontmostApplicationName: "Mail"
         ))
 
-        let lines = try #require(thirdDocument).text.split(separator: "\n")
-        #expect(lines.count == 3)
-        #expect(lines[0].contains("Xcode"))
-        #expect(lines[1].contains("Safari"))
-        #expect(lines[2].contains("Mail"))
+        // First line is the retrieval header; data lines follow.
+        let dataLines = Array(try #require(thirdDocument).text.split(separator: "\n").dropFirst())
+        #expect(dataLines.count == 3)
+        #expect(dataLines[0].contains("Xcode"))
+        #expect(dataLines[1].contains("Safari"))
+        #expect(dataLines[2].contains("Mail"))
     }
 
     @Test func documentLineIncludesTimeCategoryAppAndDescriptionExcerpt() async throws {
@@ -119,7 +121,8 @@ struct PaceScreenWatchJournalTests {
             screenDescription: longDescription
         ))
 
-        let line = try #require(document?.text.split(separator: "\n").first.map(String.init))
+        // Index 1: the first line is the retrieval header.
+        let line = try #require(document?.text.split(separator: "\n").dropFirst().first.map(String.init))
         let timeOfDay = PaceScreenWatchJournal.timeFormatter.string(from: recordedAt)
         #expect(line.hasPrefix("\(timeOfDay) | content update | app: Safari | "))
         let descriptionPart = line.components(separatedBy: " | ")[3]

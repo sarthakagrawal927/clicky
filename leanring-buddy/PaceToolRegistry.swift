@@ -384,6 +384,16 @@ enum PaceToolRegistry {
             validationIssues.append(.init(message: "registry must contain at least one local tool"))
         }
 
+        // Hard product invariant: Pace ships NO destructive tools. Every
+        // mutation must be undoable, collision-safe, or draft-only. Startup
+        // fails if a destructive-risk definition is ever added, so the
+        // planner can never gain access to one silently.
+        for destructiveDefinition in localTools.filter({ $0.riskLevel == .destructive }) {
+            validationIssues.append(.init(
+                message: "\(destructiveDefinition.canonicalName) is destructive — Pace does not permit destructive tools"
+            ))
+        }
+
         let registeredKinds = Set(localTools.map(\.kind))
         let expectedKinds = Set(PaceLocalToolKind.allCases)
         for missingKind in expectedKinds.subtracting(registeredKinds).sorted(by: { $0.rawValue < $1.rawValue }) {

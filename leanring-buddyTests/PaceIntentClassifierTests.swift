@@ -47,6 +47,21 @@ struct PaceIntentClassifierTests {
         }
     }
 
+    @Test func journalRecallQuestionsRouteTextOnly() async throws {
+        let classifier = PaceIntentClassifier()
+        for question in [
+            "what apps did i use today",
+            "what did i do today",
+            "how did i spend my time this afternoon",
+            "what have i been working on",
+            "what was i doing earlier",
+        ] {
+            let prediction = classifier.classify(question)
+            #expect(prediction.intent == .pureKnowledge, "expected pureKnowledge for \(question), got \(prediction.intent)")
+            #expect(prediction.route == .answerDirectly)
+        }
+    }
+
     @Test func screenDescriptionRequests() async throws {
         let classifier = PaceIntentClassifier()
         for request in [

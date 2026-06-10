@@ -52,7 +52,7 @@
 	<key>PrewarmMailForDrafts</key>
 	<string>true</string>
 	<key>TranscriptionProvider</key>
-	<string>appleSpeech</string>
+	<string>whisperKit</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Pace uses your microphone so you can talk to it</string>
 	<key>NSAppleEventsUsageDescription</key>

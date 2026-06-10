@@ -1863,7 +1863,7 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await plannerForTextOnlyTurn.generateResponseStreaming(
                     images: [],
-                    systemPrompt: CompanionSystemPrompt.build(includeAgentMode: false),
+                    systemPrompt: CompanionSystemPrompt.buildTextOnly(),
                     conversationHistory: historyForPlanner,
                     userPrompt: userPromptForPlanner,
                     onTextChunk: { [weak self] accumulatedPlannerText in

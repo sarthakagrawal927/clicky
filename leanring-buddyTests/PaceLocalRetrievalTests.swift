@@ -381,8 +381,44 @@ struct PaceLocalRetrievalTests {
         let flushedDocument = try #require(flushed_flushedDocument)
         retriever.recordAppUsageDocument(flushedDocument)
 
+        // The exact phrasing a user says — must match through the doc's
+        // natural-language retrieval header, not just lucky data tokens.
         let contextBlock = retriever.localContextBlock(
-            for: PaceRetrievalQuery(text: "how did I spend my time in Xcode Safari switches")
+            for: PaceRetrievalQuery(text: "what apps did I use today")
+        )
+        #expect(contextBlock?.contains("App usage journal") == true)
+        #expect(contextBlock?.contains("Xcode") == true)
+        #expect(PaceRetrievalContextPolicy.shouldQueryLocalContext(
+            forTranscript: "what apps did I use today",
+            route: .answerDirectly
+        ))
+    }
+
+    @Test func repeatedIdenticalPaceTurnsDoNotCrowdOutJournalDocuments() async throws {
+        let store = PaceInMemoryRetrievalStore()
+        let retriever = PaceLocalRetriever(
+            store: store,
+            appliesPersistedSourcePreferences: false
+        )
+
+        // Self-poisoning setup: several past turns echo the exact question
+        // (and a useless answer). They match the query perfectly and would
+        // fill every slot without source-diverse selection.
+        for turnIndex in 0..<5 {
+            retriever.recordPaceHistory(
+                userTranscript: "what apps did I use today",
+                assistantResponse: "i can't see a list of apps on this screen (attempt \(turnIndex)).",
+                now: Date().addingTimeInterval(TimeInterval(turnIndex))
+            )
+        }
+
+        var journal = retriever.rehydratedAppUsageJournal()
+        journal.recordActivation(appName: "Xcode", at: Date().addingTimeInterval(-600))
+        let flushedJournalDocument = journal.flush(now: Date())
+        retriever.recordAppUsageDocument(try #require(flushedJournalDocument))
+
+        let contextBlock = retriever.localContextBlock(
+            for: PaceRetrievalQuery(text: "what apps did I use today")
         )
         #expect(contextBlock?.contains("App usage journal") == true)
         #expect(contextBlock?.contains("Xcode") == true)

@@ -175,6 +175,20 @@ final class PaceIntentClassifier {
         "add things", "run shortcut", "open messages",
     ]
 
+    /// Journal-recall hints — questions about the user's own past activity.
+    /// These answer from the local retrieval journals (screen watch + app
+    /// usage), not from the current screen, so they route text-only: no
+    /// screenshot, no VLM, and the LOCAL CONTEXT block carries the history.
+    private static let journalRecallHints: [String] = [
+        "what did i do today", "what did i do yesterday",
+        "what did i do this morning", "what apps did i use",
+        "which apps did i use", "how did i spend my time",
+        "how am i spending my time", "how much time did i spend",
+        "what have i been working on", "what have i been doing",
+        "what was i doing earlier", "what was i working on",
+        "summarize my day", "summarise my day",
+    ]
+
     /// Description hints — phrases that suggest the user wants Pace to
     /// describe the screen rather than act on it.
     private static let descriptionHints: [String] = [
@@ -212,6 +226,15 @@ final class PaceIntentClassifier {
         for largeModelHint in Self.largeModelHints {
             if lowercaseTranscript.contains(largeModelHint) {
                 return PaceIntentPrediction(intent: .phoneLargeModel, confidence: 0.90)
+            }
+        }
+
+        // Journal recall checked BEFORE description/action rules: "what
+        // apps did i use" must not read as a screen question ("apps") or
+        // an action ("use"), and the answer lives in local history.
+        for journalRecallHint in Self.journalRecallHints {
+            if lowercaseTranscript.contains(journalRecallHint) {
+                return PaceIntentPrediction(intent: .pureKnowledge, confidence: 0.85)
             }
         }
 

@@ -5226,6 +5226,14 @@ enum PaceActionTagParser {
         let mergedArguments = mergeMCPArguments(from: toolCall)
         var issues: [String] = []
 
+        // Defense-in-depth for the no-destructive-tools invariant (also
+        // enforced by registry startup validation): even if a destructive
+        // definition slipped past startup, its calls are rejected here
+        // before approval or execution.
+        if PaceToolRegistry.localTools.first(where: { $0.kind == kind })?.riskLevel == .destructive {
+            issues.append("destructive actions are not permitted")
+        }
+
         switch kind {
         case .click, .doubleClick:
             if parseToolCallLocation(toolCall) == nil && parseClickCandidateSet(toolCall, clickCount: 1) == nil {

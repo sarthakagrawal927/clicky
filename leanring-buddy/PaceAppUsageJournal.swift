@@ -124,11 +124,16 @@ nonisolated struct PaceAppUsageJournal {
         let lines = sortedUsages.map { appName, appUsage in
             "\(appName) | \(Int(appUsage.accumulatedSeconds / 60))m | \(appUsage.switchCount) switches"
         }
+        // Natural-language header so BM25 lexical retrieval can match
+        // questions like "what apps did I use" / "how did I spend my time" —
+        // only document text is indexed, and the data lines share no tokens
+        // with those questions. Rehydration parsers skip it (wrong shape).
+        let retrievalHeader = "Apps used and time spent (app usage, screen time, how I spend my time) on \(dayKey):"
         return PaceRetrievalDocument(
             id: "\(Self.documentIdPrefix)-\(dayKey)",
             source: .appUsageHistory,
             title: "App usage journal — \(dayKey)",
-            text: lines.joined(separator: "\n"),
+            text: ([retrievalHeader] + lines).joined(separator: "\n"),
             modifiedAt: Self.dayFormatter.date(from: dayKey),
             permissionScope: "app-usage"
         )

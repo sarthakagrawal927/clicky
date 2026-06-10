@@ -125,11 +125,16 @@ nonisolated struct PaceScreenWatchJournal {
     // MARK: - Document building
 
     private static func document(for bucket: DayBucket) -> PaceRetrievalDocument {
-        PaceRetrievalDocument(
+        // Natural-language header so BM25 lexical retrieval can match
+        // questions like "what was I doing" / "what did I do" — only document
+        // text is indexed, and the data lines share few tokens with those
+        // questions. The rehydration line parser skips it (wrong shape).
+        let retrievalHeader = "Screen activity: what I was doing and what I did on \(bucket.dayKey) (\(bucket.screenLabel)):"
+        return PaceRetrievalDocument(
             id: documentId(dayKey: bucket.dayKey, screenLabel: bucket.screenLabel),
             source: .screenWatchHistory,
             title: "Screen activity journal — \(bucket.dayKey) — \(bucket.screenLabel)",
-            text: bucket.lines.map(\.renderedText).joined(separator: "\n"),
+            text: ([retrievalHeader] + bucket.lines.map(\.renderedText)).joined(separator: "\n"),
             modifiedAt: bucket.lines.last?.recordedAt,
             permissionScope: "screen-watch"
         )

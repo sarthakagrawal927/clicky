@@ -31,9 +31,10 @@ struct PaceAppUsageJournalTests {
         let flushed_document = journal.flush(now: startedAt.addingTimeInterval(1860))
         let document = try #require(flushed_document)
 
-        let lines = document.text.split(separator: "\n")
-        #expect(lines.first?.hasPrefix("Xcode") == true)
-        #expect(lines.last?.hasPrefix("Mail") == true)
+        // First line is the retrieval header; data lines follow.
+        let dataLines = document.text.split(separator: "\n").dropFirst()
+        #expect(dataLines.first?.hasPrefix("Xcode") == true)
+        #expect(dataLines.last?.hasPrefix("Mail") == true)
     }
 
     @Test func reactivationOfFrontmostAppDoesNotDoubleCountSwitches() async throws {
