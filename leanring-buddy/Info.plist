@@ -31,6 +31,16 @@
 	<string>http://localhost:1234/v1</string>
 	<key>LocalPlannerModelIdentifier</key>
 	<string>qwen/qwen3-30b-a3b</string>
+	<key>TTSProvider</key>
+	<string>localServer</string>
+	<key>LocalTTSServerBaseURL</key>
+	<string>http://localhost:8880/v1</string>
+	<key>LocalTTSServerModel</key>
+	<string>mlx-community/Kokoro-82M-bf16</string>
+	<key>LocalTTSServerVoice</key>
+	<string>af_heart</string>
+	<key>LocalTTSServerSpeed</key>
+	<string>1.0</string>
 	<key>LocalTTSVoiceIdentifier</key>
 	<string>com.apple.voice.compact.en-IN.Rishi</string>
 	<key>LocalTTSSpeechRate</key>

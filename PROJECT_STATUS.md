@@ -66,6 +66,10 @@ alongside Project Minimi.
 
 1. Resolve fleet registry identity: either add this repo as `clickyLocal` /
    `pace` / `space`, or document why it remains outside the fleet registry.
+2. Network observability tool access: expose Sniffnet
+   (github.com/GyulyVGC/sniffnet) to the agent loop — most likely as an MCP
+   server or CLI-backed tool — so Pace can answer "what's using my network?"
+   locally.
 2. Install one live OSS MCP server (e.g. filesystem or Altic) on this machine
    and exercise it through a real voice turn; the bridge itself is already
    test-proven against the fixture.
