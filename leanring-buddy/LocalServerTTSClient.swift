@@ -26,10 +26,12 @@ nonisolated struct LocalServerTTSConfiguration: Equatable {
     static let defaultModelIdentifier = "kokoro"
     static let defaultVoiceIdentifier = "af_heart"
     static let defaultSpeed = 1.0
-    // 20s, not 5s — Kokoro's FIRST synthesis after the model has been
-    // paged out can take 10-15s while MLX reloads weights. A tight
-    // timeout there sends an entire turn of audio to the Apple fallback.
-    static let requestTimeoutInSeconds: TimeInterval = 20
+    // 60s: mlx-audio's first synth after the sidecar boots (Pace now
+    // auto-starts it) is ~20-30s while Kokoro's weights actually load
+    // into MLX. Subsequent synths are ~150-400ms. A generous ceiling
+    // here means the very first reply after launch still gets the
+    // local voice instead of silent drop.
+    static let requestTimeoutInSeconds: TimeInterval = 60
     // 5s, not 30s — when the sidecar truly is down we want to know on
     // the next sentence, not after the whole turn. The brief memo only
     // exists to avoid hammering a dead port mid-sentence-burst.

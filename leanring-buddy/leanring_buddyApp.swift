@@ -65,6 +65,12 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // Fire-and-forget — app launch is not blocked. Companion
         // unload happens in `applicationWillTerminate`.
         PaceLMStudioModelLoader.warmUpConfiguredModelsAsync()
+        // Auto-start the Kokoro TTS sidecar so the user never has to
+        // remember scripts/start-tts-server.sh. Idempotent — does
+        // nothing if the sidecar is already reachable on the configured
+        // port. Detached so it survives Pace quit/restart and stays
+        // warm for the next launch.
+        PaceTTSSidecarLauncher.startIfNotRunning()
         prewarmMailForFastDraftsIfNeeded()
 
         let menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
