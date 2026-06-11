@@ -1482,7 +1482,7 @@ final class PaceActionExecutor {
         guard await requestCalendarAccessIfNeeded() else {
             return PaceActionExecutionObservation(
                 toolName: "calendar",
-                summary: "Calendar access was not granted."
+                summary: "Calendar access not granted. Open System Settings → Privacy & Security → Calendars and toggle Pace on."
             )
         }
 
@@ -1542,7 +1542,7 @@ final class PaceActionExecutor {
         guard await requestCalendarAccessIfNeeded() else {
             return PaceActionExecutionObservation(
                 toolName: "calendar_create",
-                summary: "Calendar access was not granted."
+                summary: "Calendar access not granted. Open System Settings → Privacy & Security → Calendars and toggle Pace on."
             )
         }
 
@@ -1608,7 +1608,7 @@ final class PaceActionExecutor {
         guard await requestReminderAccessIfNeeded() else {
             return PaceActionExecutionObservation(
                 toolName: "reminder",
-                summary: "Reminder access was not granted."
+                summary: "Reminders access not granted. Open System Settings → Privacy & Security → Reminders and toggle Pace on."
             )
         }
 
@@ -2257,22 +2257,15 @@ final class PaceActionExecutor {
     }
 
     private func requestContactsAccessIfNeeded() async -> Bool {
+        // Never trigger a mid-action TCC prompt — fail with an error
+        // observation if the user hasn't granted access yet. They grant
+        // once from System Settings on their own time, not while a
+        // dictation turn is in progress.
         let authorizationStatus = CNContactStore.authorizationStatus(for: .contacts)
         switch authorizationStatus {
         case .authorized, .limited:
             return true
-        case .denied, .restricted:
-            return false
-        case .notDetermined:
-            return await withCheckedContinuation { continuation in
-                contactStore.requestAccess(for: .contacts) { granted, error in
-                    if let error {
-                        print("⚠️ PaceActionExecutor: contacts access error: \(error.localizedDescription)")
-                    }
-                    continuation.resume(returning: granted)
-                }
-            }
-        @unknown default:
+        default:
             return false
         }
     }
@@ -2466,43 +2459,22 @@ final class PaceActionExecutor {
     }
 
     private func requestCalendarAccessIfNeeded() async -> Bool {
-        await withCheckedContinuation { continuation in
-            if #available(macOS 14.0, *) {
-                eventStore.requestFullAccessToEvents { granted, error in
-                    if let error {
-                        print("⚠️ PaceActionExecutor: calendar access error: \(error.localizedDescription)")
-                    }
-                    continuation.resume(returning: granted)
-                }
-            } else {
-                eventStore.requestAccess(to: .event) { granted, error in
-                    if let error {
-                        print("⚠️ PaceActionExecutor: calendar access error: \(error.localizedDescription)")
-                    }
-                    continuation.resume(returning: granted)
-                }
-            }
-        }
+        // No mid-action TCC prompt: check status, fail with an error
+        // observation if missing. The user grants once from Settings on
+        // their own time, never during a voice turn.
+        return Self.isEventKitAccessAlreadyGranted(for: .event)
     }
 
     private func requestReminderAccessIfNeeded() async -> Bool {
-        await withCheckedContinuation { continuation in
-            if #available(macOS 14.0, *) {
-                eventStore.requestFullAccessToReminders { granted, error in
-                    if let error {
-                        print("⚠️ PaceActionExecutor: reminders access error: \(error.localizedDescription)")
-                    }
-                    continuation.resume(returning: granted)
-                }
-            } else {
-                eventStore.requestAccess(to: .reminder) { granted, error in
-                    if let error {
-                        print("⚠️ PaceActionExecutor: reminders access error: \(error.localizedDescription)")
-                    }
-                    continuation.resume(returning: granted)
-                }
-            }
+        return Self.isEventKitAccessAlreadyGranted(for: .reminder)
+    }
+
+    private static func isEventKitAccessAlreadyGranted(for entityType: EKEntityType) -> Bool {
+        let authorizationStatus = EKEventStore.authorizationStatus(for: entityType)
+        if #available(macOS 14.0, *) {
+            return authorizationStatus == .fullAccess
         }
+        return authorizationStatus == .authorized
     }
 
     private func runAppleScript(source: String) -> (output: String?, errorDescription: String?) {
