@@ -16,6 +16,9 @@ import Foundation
 
 nonisolated struct PaceAPIAuditEntry: Codable, Equatable {
     let at: Date
+    /// Stable id shared by every entry recorded during the same user turn,
+    /// so the audit log can be replayed as a timeline per question.
+    let turnId: String?
     let subsystem: String
     let operation: String
     let target: String
@@ -35,6 +38,32 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.pace.api-audit", qos: .utility)
     private let logFileURL: URL
     private let encoder: JSONEncoder
+    private let currentTurnIdLock = NSLock()
+    private var _currentTurnId: String?
+
+    /// Stable id shared by every audit record produced during one user
+    /// turn. CompanionManager sets it on PTT-release / deeplink arrival;
+    /// every subsystem (planner, VLM, TTS, MCP, action executor) picks it
+    /// up automatically through `record(...)`.
+    var currentTurnId: String? {
+        currentTurnIdLock.lock()
+        defer { currentTurnIdLock.unlock() }
+        return _currentTurnId
+    }
+
+    func beginTurn() -> String {
+        let newTurnId = UUID().uuidString
+        currentTurnIdLock.lock()
+        _currentTurnId = newTurnId
+        currentTurnIdLock.unlock()
+        return newTurnId
+    }
+
+    func endCurrentTurn() {
+        currentTurnIdLock.lock()
+        _currentTurnId = nil
+        currentTurnIdLock.unlock()
+    }
 
     init(logFileURL: URL? = nil) {
         self.logFileURL = logFileURL ?? Self.defaultLogFileURL()
@@ -59,6 +88,7 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
     ) {
         let entry = PaceAPIAuditEntry(
             at: timestamp,
+            turnId: currentTurnId,
             subsystem: subsystem,
             operation: operation,
             target: target,

@@ -50,9 +50,33 @@ def load_entries(cutoff):
     return entries
 
 
+def render_turn_timeline(entries):
+    by_turn = defaultdict(list)
+    for entry in entries:
+        turn_id = entry.get("turnId")
+        if turn_id:
+            by_turn[turn_id].append(entry)
+    if not by_turn:
+        print("(no turn-tagged entries — older log, or no turns recorded)")
+        return
+    print(f"\n{len(by_turn)} turn(s):\n")
+    for turn_id in sorted(by_turn, key=lambda t: by_turn[t][0].get("at", "")):
+        turn_entries = sorted(by_turn[turn_id], key=lambda e: e.get("at", ""))
+        first_at = turn_entries[0].get("at", "")
+        total_ms = sum(e.get("durationMilliseconds", 0) for e in turn_entries)
+        any_error = any(e.get("outcome") != "ok" for e in turn_entries)
+        marker = "✗" if any_error else "✓"
+        print(f"{marker} turn {turn_id[:8]}  start={first_at}  total={total_ms}ms")
+        for entry in turn_entries:
+            outcome_marker = "  " if entry.get("outcome") == "ok" else "!!"
+            target = (entry.get("target") or "")[:36]
+            print(f"   {outcome_marker} {entry.get('subsystem'):<10} {entry.get('operation','')[:22]:<22} {target:<36} {entry.get('durationMilliseconds',0):>6}ms  {entry.get('outcome')}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--last", type=int, metavar="MINUTES", help="only entries from the last N minutes")
+    parser.add_argument("--turns", action="store_true", help="per-turn timeline view instead of subsystem rollup")
     args = parser.parse_args()
 
     cutoff = None
@@ -63,6 +87,10 @@ def main():
     if not entries:
         print(f"no audit entries found at {LOG_PATH}")
         sys.exit(0)
+
+    if args.turns:
+        render_turn_timeline(entries)
+        return
 
     groups = defaultdict(list)
     for entry in entries:

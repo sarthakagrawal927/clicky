@@ -753,6 +753,31 @@ final class PaceActionExecutor {
         _ action: PaceParsedAction,
         screenCaptures: [CompanionScreenCapture]
     ) async -> PaceActionExecutionObservation? {
+        let observation = await dispatchSingleAction(action, screenCaptures: screenCaptures)
+        let outcomeText: String
+        if let observation, observation.summary.lowercased().contains("fail")
+            || observation.summary.lowercased().contains("error")
+            || observation.summary.lowercased().contains("could not") {
+            outcomeText = "error"
+        } else {
+            outcomeText = "ok"
+        }
+        PaceAPIAuditLog.shared.record(
+            subsystem: "action",
+            operation: action.auditOperationName,
+            target: action.auditTarget,
+            durationMilliseconds: 0,
+            outcome: outcomeText,
+            outputCharacterCount: observation?.summary.count,
+            detail: observation?.summary.prefix(160).description
+        )
+        return observation
+    }
+
+    private func dispatchSingleAction(
+        _ action: PaceParsedAction,
+        screenCaptures: [CompanionScreenCapture]
+    ) async -> PaceActionExecutionObservation? {
         switch action {
         case .click(let location):
             await clickAtScreenshotLocation(location, screenCaptures: screenCaptures, clickCount: 1)
@@ -3234,6 +3259,89 @@ enum PaceParsedAction {
     case openMessages(PaceMessageRequest)
     case downloadFile(PaceFileDownloadRequest)
     case mcp(PaceMCPToolCall)
+
+    /// Audit-log operation slug — the verb part. Mirrors the case name.
+    var auditOperationName: String {
+        switch self {
+        case .click: return "click"
+        case .doubleClick: return "double_click"
+        case .clickCandidates: return "click_candidates"
+        case .type: return "type"
+        case .setTextValue: return "set_value"
+        case .editSelectedText: return "edit_selection"
+        case .undoLastMutation: return "undo"
+        case .pressKey: return "key_press"
+        case .readClipboard: return "clipboard_read"
+        case .snapWindow: return "window_snap"
+        case .scroll: return "scroll"
+        case .openApplication: return "open_app"
+        case .openURL: return "open_url"
+        case .controlMusic: return "music"
+        case .adjustVolume: return "volume"
+        case .adjustBrightness: return "brightness"
+        case .listCalendarEvents: return "calendar_read"
+        case .createCalendarEvent: return "calendar_create"
+        case .createReminder: return "reminder_create"
+        case .finder: return "finder"
+        case .createNote: return "note_create"
+        case .appendNote: return "note_append"
+        case .searchNotes: return "note_search"
+        case .composeMail: return "mail_draft"
+        case .createThingsToDo: return "things_create"
+        case .runShortcut: return "shortcut_run"
+        case .openMessages: return "messages_open"
+        case .downloadFile: return "download_file"
+        case .mcp: return "mcp_call"
+        }
+    }
+
+    /// Audit-log target — the noun: what app, server, or URL the action
+    /// touches. Sizes capped so even pathological inputs stay log-safe.
+    var auditTarget: String {
+        switch self {
+        case .openApplication(let appName):
+            return appName
+        case .openURL(let urlString):
+            return String(urlString.prefix(120))
+        case .runShortcut(let name):
+            return name
+        case .openMessages(let request):
+            return request.recipient ?? "messages"
+        case .composeMail(let draft):
+            return draft.recipients.first ?? "mail"
+        case .createCalendarEvent(let request):
+            return String(request.title.prefix(60))
+        case .createReminder(let request):
+            return String(request.title.prefix(60))
+        case .createNote(let request), .appendNote(let request):
+            return String(request.title.prefix(60))
+        case .searchNotes(let query):
+            return String(query.prefix(60))
+        case .createThingsToDo(let request):
+            return String(request.title.prefix(60))
+        case .finder(let request):
+            return String(request.path.prefix(120))
+        case .downloadFile(let request):
+            return String(request.url.absoluteString.prefix(120))
+        case .mcp(let toolCall):
+            return "\(toolCall.serverName).\(toolCall.toolName)"
+        case .pressKey(let keyName, let modifiers):
+            let modifierPrefix = modifiers.isEmpty
+                ? ""
+                : modifiers.map(\.rawValue).joined(separator: "+") + "+"
+            return "\(modifierPrefix)\(keyName)"
+        case .controlMusic(let command):
+            return command.rawValue
+        case .adjustVolume, .adjustBrightness:
+            return auditOperationName
+        case .scroll(let direction, _):
+            return direction.rawValue
+        case .snapWindow(let request):
+            return request.position.rawValue
+        default:
+            return ""
+        }
+    }
 
     var approvalDescription: String {
         switch self {

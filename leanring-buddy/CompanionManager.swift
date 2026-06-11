@@ -1248,6 +1248,7 @@ final class CompanionManager: ObservableObject {
         }
 
         lastTranscript = transcript
+        _ = PaceAPIAuditLog.shared.beginTurn()
         PaceAnalytics.trackUserMessageSent(transcript: transcript)
         currentTurnHUDState = .understanding("classifying intent")
         responseOverlayManager.setAnchor(.belowRightOfCursor)
@@ -1755,6 +1756,7 @@ final class CompanionManager: ObservableObject {
                             // safety timer skips its cleanup pass.
                             self.transcriptArrivedSinceRelease = true
                             self.lastTranscript = finalTranscript
+                            _ = PaceAPIAuditLog.shared.beginTurn()
                             print("🗣️ Companion received transcript: \(finalTranscript)")
                             PaceAnalytics.trackUserMessageSent(transcript: finalTranscript)
                             self.currentTurnHUDState = .understanding("classifying intent")

@@ -121,14 +121,27 @@ final class LocalServerTTSClient: NSObject, BuddyTTSClient {
         warmUpSynthesizer()
     }
 
-    /// Fire-and-forget warm-up synth at construction so the user's FIRST
-    /// real sentence after launch doesn't pay Kokoro's 10-15s cold-load
-    /// cost and fall through to the Apple voice. The result audio is
-    /// thrown away — only the model load matters.
+    /// Polls the sidecar until it's actually reachable, then fires a tiny
+    /// synth so Kokoro's MLX weights are resident before the user's first
+    /// real sentence arrives. Without the poll, the warmup races the
+    /// auto-started sidecar and silently fails — meaning the first real
+    /// turn still pays the 20-30s cold-load tax.
     private func warmUpSynthesizer() {
         let warmUpConfiguration = configuration
         let warmUpSession = urlSession
-        Task.detached(priority: .background) {
+        Task.detached(priority: .userInitiated) {
+            let modelsURL = warmUpConfiguration.baseURL.appendingPathComponent("models")
+            for attempt in 0..<60 {
+                var probeRequest = URLRequest(url: modelsURL)
+                probeRequest.timeoutInterval = 2
+                if let (_, response) = try? await warmUpSession.data(for: probeRequest),
+                   let httpResponse = response as? HTTPURLResponse,
+                   (200..<500).contains(httpResponse.statusCode) {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                _ = attempt
+            }
             let warmUpRequest = warmUpConfiguration.speechRequest(for: ".")
             _ = try? await warmUpSession.data(for: warmUpRequest)
         }

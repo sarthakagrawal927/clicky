@@ -42,7 +42,7 @@
 	<key>LocalTTSServerVoice</key>
 	<string>af_heart</string>
 	<key>LocalTTSServerSpeed</key>
-	<string>1.0</string>
+	<string>1.2</string>
 	<key>LocalTTSVoiceIdentifier</key>
 	<string>com.apple.voice.compact.en-IN.Rishi</string>
 	<key>LocalTTSSpeechRate</key>
