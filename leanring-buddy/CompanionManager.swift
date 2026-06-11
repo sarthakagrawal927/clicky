@@ -3180,14 +3180,20 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message via the system NSSpeechSynthesizer
-    /// when the main planner/TTS path fails — independent of LM Studio and
-    /// the main TTS pipeline so the user always hears something.
+    /// Surfaces a planner/TTS failure silently — visible in the response
+    /// overlay (already updated by the caller) and the audit log, but
+    /// never spoken through NSSpeechSynthesizer. The previous Apple-voice
+    /// "Something went wrong" line was rated worse than no audio.
     private func speakCreditsErrorFallback() {
-        let utterance = "Something went wrong on my end. Check the console for details."
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
-        voiceState = .responding
+        currentTurnHUDState = .failed("response error")
+        PaceAPIAuditLog.shared.record(
+            subsystem: "pipeline",
+            operation: "error",
+            target: "companion-manager",
+            durationMilliseconds: 0,
+            outcome: "error",
+            detail: "main planner/TTS path failed"
+        )
     }
 
 }
