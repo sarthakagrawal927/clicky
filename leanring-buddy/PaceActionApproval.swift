@@ -103,7 +103,8 @@ nonisolated enum PaceActionApprovalPolicy {
     private static func requiresExplicitApproval(_ action: PaceParsedAction) -> Bool {
         switch action {
         case .createCalendarEvent, .createReminder, .createNote, .appendNote,
-             .composeMail, .createThingsToDo, .runShortcut, .downloadFile, .mcp:
+             .composeMail, .createThingsToDo, .runShortcut, .downloadFile,
+             .recordFlow, .runFlow, .mcp:
             return true
         case .openMessages(let messageRequest):
             return messageRequest.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -125,7 +126,8 @@ nonisolated enum PaceActionApprovalPolicy {
         case .openMessages(let messageRequest):
             return messageRequest.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
         case .createCalendarEvent, .createReminder, .createNote, .appendNote,
-             .composeMail, .createThingsToDo, .runShortcut, .downloadFile, .mcp:
+             .composeMail, .createThingsToDo, .runShortcut, .downloadFile,
+             .recordFlow, .runFlow, .mcp:
             return false
         }
     }

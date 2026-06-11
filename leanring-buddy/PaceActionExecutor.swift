@@ -843,6 +843,10 @@ final class PaceActionExecutor {
             return await downloadFile(downloadRequest)
         case .startTimer(let timerRequest):
             return await startTimer(timerRequest)
+        case .recordFlow(let flowRequest):
+            return recordFlow(flowRequest)
+        case .runFlow(let flowRequest):
+            return runFlow(flowRequest)
         case .mcp(let mcpToolCall):
             return await callMCPTool(mcpToolCall)
         }
@@ -1323,6 +1327,41 @@ final class PaceActionExecutor {
         return PaceActionExecutionObservation(
             toolName: "start_timer",
             summary: "Timer set\(labelSuffix) for \(humanDurationText) — fires at \(scheduledTimer.fireDate.formatted(date: .omitted, time: .shortened))."
+        )
+    }
+
+    private func recordFlow(_ flowRequest: PaceFlowActionRequest) -> PaceActionExecutionObservation {
+        let flowName = flowRequest.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !flowName.isEmpty else {
+            return PaceActionExecutionObservation(
+                toolName: "record_flow",
+                summary: "Flow recording needs a name."
+            )
+        }
+        return PaceActionExecutionObservation(
+            toolName: "record_flow",
+            summary: "Ready to record flow \"\(flowName)\". The AX event recorder is queued; no screen pixels or coordinates will be stored."
+        )
+    }
+
+    private func runFlow(_ flowRequest: PaceFlowActionRequest) -> PaceActionExecutionObservation {
+        let flowName = flowRequest.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !flowName.isEmpty else {
+            return PaceActionExecutionObservation(
+                toolName: "run_flow",
+                summary: "Flow replay needs a name."
+            )
+        }
+        let storedFlow = PaceFlowStore().load(named: flowName)
+        guard let storedFlow else {
+            return PaceActionExecutionObservation(
+                toolName: "run_flow",
+                summary: "No recorded flow named \"\(flowName)\" was found."
+            )
+        }
+        return PaceActionExecutionObservation(
+            toolName: "run_flow",
+            summary: "Flow \"\(storedFlow.name)\" has \(storedFlow.steps.count) saved step(s). Replay execution is approval-gated and queued for the AX replayer."
         )
     }
 
@@ -3006,7 +3045,7 @@ final class PaceActionExecutor {
 
     // MARK: - Key name → virtual key code
 
-    static func virtualKeyCode(forKeyName keyName: String) -> CGKeyCode? {
+    nonisolated static func virtualKeyCode(forKeyName keyName: String) -> CGKeyCode? {
         // ANSI (US-layout) virtual key codes for every letter, digit, common
         // punctuation, function key, and named key. parseKeyPayload validates
         // against this table, so parse-time acceptance and execution-time
@@ -3281,6 +3320,8 @@ enum PaceParsedAction {
     case openMessages(PaceMessageRequest)
     case downloadFile(PaceFileDownloadRequest)
     case startTimer(PaceTimerRequest)
+    case recordFlow(PaceFlowActionRequest)
+    case runFlow(PaceFlowActionRequest)
     case mcp(PaceMCPToolCall)
 
     /// Audit-log operation slug — the verb part. Mirrors the case name.
@@ -3315,6 +3356,8 @@ enum PaceParsedAction {
         case .openMessages: return "messages_open"
         case .downloadFile: return "download_file"
         case .startTimer: return "start_timer"
+        case .recordFlow: return "record_flow"
+        case .runFlow: return "run_flow"
         case .mcp: return "mcp_call"
         }
     }
@@ -3349,6 +3392,8 @@ enum PaceParsedAction {
             return String(request.url.absoluteString.prefix(120))
         case .startTimer(let request):
             return String(request.label.prefix(60))
+        case .recordFlow(let request), .runFlow(let request):
+            return String(request.name.prefix(80))
         case .mcp(let toolCall):
             return "\(toolCall.serverName).\(toolCall.toolName)"
         case .pressKey(let keyName, let modifiers):
@@ -3455,6 +3500,10 @@ enum PaceParsedAction {
                 return "Start \(durationMinutes)-minute timer"
             }
             return "Start timer for \(Int(timerRequest.durationInSeconds))s"
+        case .recordFlow(let flowRequest):
+            return "Record flow: \(flowRequest.name)"
+        case .runFlow(let flowRequest):
+            return "Run recorded flow: \(flowRequest.name)"
         case .mcp(let mcpToolCall):
             return "Call MCP tool: \(mcpToolCall.approvalDescription)"
         }
@@ -3670,6 +3719,10 @@ struct PaceReminderRequest {
 struct PaceTimerRequest {
     let label: String
     let durationInSeconds: TimeInterval
+}
+
+struct PaceFlowActionRequest {
+    let name: String
 }
 
 struct PaceFinderRequest {
@@ -5369,6 +5422,32 @@ enum PaceActionTagParser {
             return parseDownloadFileToolCall(toolCall)
         case .startTimer:
             return parseStartTimerToolCall(toolCall)
+        case .recordFlow:
+            return parseFlowToolCall(toolCall, action: .record)
+        case .runFlow:
+            return parseFlowToolCall(toolCall, action: .run)
+        }
+    }
+
+    private enum FlowToolAction {
+        case record
+        case run
+    }
+
+    private static func parseFlowToolCall(_ toolCall: ToolCallDTO, action: FlowToolAction) -> PaceParsedAction? {
+        let mergedArguments = mergeMCPArguments(from: toolCall)
+        guard let rawName = firstStringValue(
+            for: ["name", "title", "flow", "label"],
+            in: mergedArguments
+        ) else {
+            return nil
+        }
+        let request = PaceFlowActionRequest(name: rawName.trimmingCharacters(in: .whitespacesAndNewlines))
+        switch action {
+        case .record:
+            return .recordFlow(request)
+        case .run:
+            return .runFlow(request)
         }
     }
 
@@ -5520,6 +5599,10 @@ enum PaceActionTagParser {
             ) ?? ""
             if PaceTimerDurationParser.seconds(from: rawDurationText) == nil {
                 issues.append("requires a valid duration (e.g. \"3 minutes\", \"30s\")")
+            }
+        case .recordFlow, .runFlow:
+            if !hasNonEmptyString(for: ["name", "title", "flow", "label"], in: mergedArguments) {
+                issues.append("requires flow name")
             }
         }
 

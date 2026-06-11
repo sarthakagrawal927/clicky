@@ -138,7 +138,7 @@ enum PaceToolPreflight {
         case .readClipboard, .openApplication, .openURL, .controlMusic, .adjustVolume, .adjustBrightness,
              .listCalendarEvents, .createCalendarEvent, .createReminder, .finder, .createNote, .appendNote,
              .searchNotes, .composeMail, .createThingsToDo, .runShortcut, .openMessages, .downloadFile,
-             .startTimer, .mcp:
+             .startTimer, .recordFlow, .runFlow, .mcp:
             return false
         }
     }
@@ -168,7 +168,7 @@ enum PaceToolPreflight {
              .undoLastMutation, .pressKey, .snapWindow, .scroll,
              .readClipboard, .openApplication, .openURL,
              .adjustVolume, .adjustBrightness, .listCalendarEvents, .createCalendarEvent,
-             .createReminder, .finder, .downloadFile, .startTimer:
+             .createReminder, .finder, .downloadFile, .startTimer, .recordFlow, .runFlow:
             return false
         }
     }
