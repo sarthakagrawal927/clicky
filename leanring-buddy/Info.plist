@@ -34,7 +34,7 @@
 	<key>LocalPlannerBaseURL</key>
 	<string>http://localhost:1234/v1</string>
 	<key>LocalPlannerModelIdentifier</key>
-	<string>qwen3-4b-instruct-2507</string>
+	<string>google/gemma-3-12b</string>
 	<key>LocalTTSPitchMultiplier</key>
 	<string>0.88</string>
 	<key>LocalTTSPostUtteranceDelay</key>

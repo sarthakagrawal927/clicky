@@ -8,7 +8,7 @@
 //  Why this exists
 //  ---------------
 //  The default `LocalPlannerModelIdentifier` in Info.plist is one
-//  hard-coded string (today: `qwen/qwen3-14b`). The moment the user's
+//  hard-coded string (today: `google/gemma-3-12b`). The moment the user's
 //  LM Studio doesn't have that exact model downloaded, every voice
 //  turn 400s with "Invalid model identifier" — and the user has to
 //  edit Info.plist and rebuild to recover. Bad UX.
@@ -92,7 +92,9 @@ enum PacePlannerModelResolver {
     /// of interesting size — we've measured this. A 1.7B model can.
     private static func logModelSizeAdviceIfWarranted(forResolvedIdentifier identifier: String) {
         let approximateBillions = approximateParameterBillions(from: identifier)
-        guard approximateBillions >= 8 else { return }
+        // Gemma-3-12B is the deliberate eval-validated default — don't
+        // advise downgrading from it. Tip only fires above that size.
+        guard approximateBillions > 12 else { return }
         let estimatedTTFTSeconds = max(2, Int(approximateBillions * 0.5))
         print("⚡ Speed tip: '\(identifier)' is \(approximateBillions)B params — expect ~\(estimatedTTFTSeconds)s TTFT on typical prompts. For sub-second voice, download `qwen3-1.7b-instruct` (~1.5GB) in LM Studio. Pace's resolver will auto-pick it.")
     }

@@ -206,7 +206,7 @@ enum PaceThreadSummarizerClientFactory {
         let configuredEndpointURLString = AppBundleConfiguration
             .stringValue(forKey: "LocalPlannerBaseURL")
         let configuredModelIdentifier = AppBundleConfiguration
-            .stringValue(forKey: "LocalPlannerModelIdentifier") ?? "qwen/qwen3-30b-a3b"
+            .stringValue(forKey: "LocalPlannerModelIdentifier") ?? "google/gemma-3-12b"
         let validatedEndpointURL = PaceLocalEndpointGuard
             .resolvedLocalOpenAICompatibleBaseURL(
                 configuredURLString: configuredEndpointURLString,
