@@ -570,12 +570,27 @@ struct PaceSettingsWindowView: View {
             Text("Apple Foundation Models")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(DS.Colors.textSecondary)
-            Text("Free, on-device. Requires Apple Intelligence to be enabled in System Settings.")
+            Text("Free, on-device. Requires Apple Intelligence to be enabled in System Settings. Best for short voice answers and routine tool calls. For harder action plans, upgrade to Local — LM Studio.")
                 .font(.system(size: 12))
                 .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
             settingsButton("Open Apple Intelligence settings", systemName: "apple.logo") {
                 if let appleIntelligenceURL = URL(string: "x-apple.systempreferences:com.apple.AppleIntelligence-Settings.extension") {
                     NSWorkspace.shared.open(appleIntelligenceURL)
+                }
+            }
+            if companionManager.isLMStudioReachable {
+                // LM Studio is already running on the user's machine —
+                // surface the upgrade affordance prominently. This is the
+                // one-click hop from "first-run default" to "best quality"
+                // promised by docs/prds/first-run-experience.md.
+                Divider().background(DS.Colors.borderSubtle).padding(.vertical, 4)
+                Text("LM Studio is running locally — upgrade for better quality on hard action plans.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                settingsButton("Upgrade to Local — LM Studio", systemName: "arrow.up.circle") {
+                    companionManager.setActivePlannerTier(.local)
                 }
             }
         }

@@ -13,6 +13,12 @@ import SwiftUI
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
 
+    /// Bumped after each starter-prompt tap or dismiss so the card
+    /// re-reads `PaceStarterPromptStore` and shows the updated state
+    /// (checkmark, dismissed, auto-dismissed-after-4-tries). The store
+    /// is UserDefaults-backed so SwiftUI doesn't see writes otherwise.
+    @State private var starterPromptStateRevision: Int = 0
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             panelHeader
@@ -27,6 +33,9 @@ struct CompanionPanelView: View {
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
+
+                starterPromptCardSection
+                    .padding(.horizontal, 16)
 
                 morningBriefCardSection
                     .padding(.horizontal, 16)
@@ -186,6 +195,113 @@ struct CompanionPanelView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - Starter prompt card (first-run "Try these")
+
+    /// First-run "Try these" card. Pinned to the top of the panel for
+    /// the first 24h after the user first opens the panel with the card
+    /// visible, then auto-hides. Reads PaceStarterPromptStore for the
+    /// tried-set and the visibility decision; writes back through the
+    /// same store when the user taps a row or hides the card.
+    @ViewBuilder
+    private var starterPromptCardSection: some View {
+        // `starterPromptStateRevision` is referenced so SwiftUI re-runs
+        // this body after a tap or dismiss writes to UserDefaults. The
+        // explicit `_ = starterPromptStateRevision` would also work, but
+        // putting the read inside the visibility check is what actually
+        // drives the dependency tracking.
+        let _ = starterPromptStateRevision
+        if PaceStarterPromptStore.isVisible() {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 6) {
+                    Text("Try these")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Spacer(minLength: 0)
+
+                    Button(action: dismissStarterPromptCard) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .frame(width: 20, height: 20)
+                            .background(
+                                Circle().fill(Color.white.opacity(0.05))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                    .help("Hide for now")
+                }
+
+                VStack(spacing: 4) {
+                    ForEach(PaceStarterPromptCatalog.all) { starterPrompt in
+                        starterPromptRow(starterPrompt: starterPrompt)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.045))
+            )
+            .padding(.bottom, 8)
+            .onAppear {
+                PaceStarterPromptStore.markFirstSeenIfNeeded()
+            }
+        }
+    }
+
+    private func starterPromptRow(starterPrompt: PaceStarterPrompt) -> some View {
+        let hasTried = PaceStarterPromptStore.hasTried(slug: starterPrompt.slug)
+        return HStack(alignment: .center, spacing: 8) {
+            Image(systemName: hasTried ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(hasTried ? DS.Colors.success : DS.Colors.textTertiary)
+                .frame(width: 14)
+
+            Text(starterPrompt.displayText)
+                .font(.system(size: 11))
+                .foregroundColor(hasTried ? DS.Colors.textTertiary : DS.Colors.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+
+            Button(action: {
+                submitStarterPrompt(starterPrompt: starterPrompt)
+            }) {
+                Text("ask")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(Color.white.opacity(0.08))
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .help("Ask Pace this — same path as voice or chat.")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func submitStarterPrompt(starterPrompt: PaceStarterPrompt) {
+        // The store is updated BEFORE submission so the checkmark
+        // appears immediately. Even if the planner call fails, the
+        // user clearly tried this prompt.
+        PaceStarterPromptStore.markTried(slug: starterPrompt.slug)
+        starterPromptStateRevision += 1
+        companionManager.submitChatTranscriptFromDeepLink(starterPrompt.displayText)
+    }
+
+    private func dismissStarterPromptCard() {
+        PaceStarterPromptStore.markDismissed()
+        starterPromptStateRevision += 1
     }
 
     // MARK: - Morning brief card

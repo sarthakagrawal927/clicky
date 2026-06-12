@@ -14,6 +14,7 @@
 //
 
 import Foundation
+import FoundationModels
 
 // MARK: - PacePlannerTier
 
@@ -119,16 +120,98 @@ private enum PlannerTierUserDefaultsKey: String {
 
 enum PacePlannerTierStore {
 
+    // MARK: First-launch detection
+
+    /// True iff NONE of the planner tier UserDefaults keys are set. Used
+    /// to decide whether the new Apple-FM-first default applies. Existing
+    /// users — anyone who has ever opened Settings → Planner — already
+    /// have at least the `selectedTier` key written, so this returns
+    /// false and the new default is gated off behind it. Hard requirement
+    /// from docs/prds/first-run-experience.md: existing users see zero
+    /// behavior change.
+    static func hasAnyPlannerTierUserDefaultsState() -> Bool {
+        let plannerTierUserDefaultsKeys: [PlannerTierUserDefaultsKey] = [
+            .selectedTier,
+            .directAPIProvider,
+            .directAPIModelIdentifier,
+            .directAPICustomEndpointURLString,
+            .fallsBackToLocalOnCloudFailure
+        ]
+        for plannerTierUserDefaultsKey in plannerTierUserDefaultsKeys {
+            if UserDefaults.standard.object(forKey: plannerTierUserDefaultsKey.rawValue) != nil {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Pure function — given a snapshot of Apple Intelligence availability,
+    /// returns the tier a brand-new install should default to. When
+    /// Apple Intelligence is available, prefer Apple Foundation Models
+    /// because it ships in-process with zero external dependency and the
+    /// goal of the first-run experience PRD is "Pace works the moment
+    /// you install it, no LM Studio needed". When Apple Intelligence is
+    /// not available, fall back to `.local` so the existing Settings →
+    /// Planner upgrade path (LM Studio install) is the next step the
+    /// user sees.
+    static func defaultTierForFirstLaunch(
+        appleIntelligenceAvailable: Bool
+    ) -> PacePlannerTier {
+        return appleIntelligenceAvailable ? .appleFoundationModels : .local
+    }
+
+    /// Resolves Apple Intelligence availability via the same
+    /// `SystemLanguageModel.default.availability` call
+    /// `AppleFoundationModelsPlannerClient` uses. Cached per process so
+    /// the answer stays stable across calls within a single Pace launch.
+    /// Returns false on older macOS where FoundationModels isn't linked.
+    private static var cachedAppleIntelligenceAvailable: Bool?
+
+    static func isAppleIntelligenceAvailableOnThisDevice() -> Bool {
+        if let cached = cachedAppleIntelligenceAvailable { return cached }
+        let resolvedAvailable: Bool
+        if #available(macOS 26.0, *) {
+            switch SystemLanguageModel.default.availability {
+            case .available:
+                resolvedAvailable = true
+            case .unavailable:
+                resolvedAvailable = false
+            @unknown default:
+                resolvedAvailable = false
+            }
+        } else {
+            resolvedAvailable = false
+        }
+        cachedAppleIntelligenceAvailable = resolvedAvailable
+        return resolvedAvailable
+    }
+
     // MARK: Load
 
     /// Returns the current tier picker configuration. When the user has
-    /// never opened the picker, `tier == .local` so existing-user behavior
-    /// stays byte-identical to today.
+    /// EVER touched the picker, the persisted tier wins and behavior
+    /// stays byte-identical to today — that's the existing-user safety
+    /// guarantee from docs/prds/first-run-experience.md.
+    ///
+    /// On a clean install (no planner-tier UserDefaults state at all),
+    /// the default tier is now derived from Apple Intelligence
+    /// availability via `defaultTierForFirstLaunch(...)`. Apple FM is
+    /// preferred when available because it works with zero external
+    /// install; otherwise the resolver falls back to `.local`.
     static func loadConfiguration() -> PacePlannerTierConfiguration {
+        let firstLaunchFallbackTier: PacePlannerTier
+        if hasAnyPlannerTierUserDefaultsState() {
+            firstLaunchFallbackTier = .local
+        } else {
+            firstLaunchFallbackTier = defaultTierForFirstLaunch(
+                appleIntelligenceAvailable: isAppleIntelligenceAvailableOnThisDevice()
+            )
+        }
+
         let rawSelectedTier = UserDefaults.standard.string(
             forKey: PlannerTierUserDefaultsKey.selectedTier.rawValue
-        ) ?? PacePlannerTier.local.rawValue
-        let resolvedTier = PacePlannerTier(rawValue: rawSelectedTier) ?? .local
+        ) ?? firstLaunchFallbackTier.rawValue
+        let resolvedTier = PacePlannerTier(rawValue: rawSelectedTier) ?? firstLaunchFallbackTier
 
         let rawDirectAPIProvider = UserDefaults.standard.string(
             forKey: PlannerTierUserDefaultsKey.directAPIProvider.rawValue

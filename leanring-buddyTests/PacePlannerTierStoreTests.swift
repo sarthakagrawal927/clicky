@@ -57,10 +57,65 @@ struct PacePlannerTierStoreTests {
     // MARK: - First-launch defaults
 
     @Test
-    func firstLaunchDefaultsToLocalTier() {
+    func firstLaunchDefaultsToLocalTierWhenAppleIntelligenceUnavailable() {
+        // Pure helper exercises the resolver directly without touching
+        // SystemLanguageModel — the production load path also depends on
+        // device state, which the harness can't control. The helper is
+        // what `loadConfiguration` calls underneath, so testing it pins
+        // the public contract.
+        let resolvedTier = PacePlannerTierStore.defaultTierForFirstLaunch(
+            appleIntelligenceAvailable: false
+        )
+        #expect(resolvedTier == .local)
+    }
+
+    @Test
+    func firstLaunchDefaultsToAppleFoundationModelsWhenAvailable() {
+        let resolvedTier = PacePlannerTierStore.defaultTierForFirstLaunch(
+            appleIntelligenceAvailable: true
+        )
+        #expect(resolvedTier == .appleFoundationModels)
+    }
+
+    @Test
+    func hasAnyPlannerTierUserDefaultsStateIsFalseOnFreshInstall() {
+        withClearedAndRestoredPlannerTierState {
+            #expect(PacePlannerTierStore.hasAnyPlannerTierUserDefaultsState() == false)
+        }
+    }
+
+    @Test
+    func hasAnyPlannerTierUserDefaultsStateIsTrueAfterAnySaveCall() {
+        withClearedAndRestoredPlannerTierState {
+            PacePlannerTierStore.saveTier(.local)
+            #expect(PacePlannerTierStore.hasAnyPlannerTierUserDefaultsState() == true)
+        }
+    }
+
+    @Test
+    func existingUserWithSavedLocalTierStaysOnLocalEvenIfFMIsAvailable() {
+        // Hard rule from docs/prds/first-run-experience.md: existing
+        // users (any UserDefaults key set) keep their pinned tier with
+        // no behavior change. This is the critical regression test —
+        // the new Apple-FM-first default MUST NOT touch existing users.
+        withClearedAndRestoredPlannerTierState {
+            PacePlannerTierStore.saveTier(.local)
+            let reloadedConfiguration = PacePlannerTierStore.loadConfiguration()
+            #expect(reloadedConfiguration.tier == .local)
+        }
+    }
+
+    @Test
+    func freshInstallLoadConfigurationDoesNotCrashAndProducesAValidTier() {
+        // We can't force-control SystemLanguageModel from a unit test,
+        // so we just sanity-check that loadConfiguration on a cleared
+        // UserDefaults returns one of the two acceptable first-launch
+        // defaults (local or appleFoundationModels). This protects the
+        // load path itself against regression.
         withClearedAndRestoredPlannerTierState {
             let configuration = PacePlannerTierStore.loadConfiguration()
-            #expect(configuration.tier == .local)
+            let acceptableFirstLaunchTiers: Set<PacePlannerTier> = [.local, .appleFoundationModels]
+            #expect(acceptableFirstLaunchTiers.contains(configuration.tier))
         }
     }
 
