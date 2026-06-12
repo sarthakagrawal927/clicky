@@ -169,6 +169,22 @@ struct BlueCursorView: View {
     /// Only during the return flight can cursor movement cancel the animation.
     @State private var isReturningToCursor: Bool = false
 
+    // MARK: - Undo banner state
+
+    /// Mirror of the manager's most-recent reversible-action timestamp,
+    /// re-evaluated on every render so the banner can hide itself after
+    /// the 5-second visibility window expires without subscribing to a
+    /// per-second timer. Driven by `scheduleUndoBannerVisibilityRefresh`.
+    @State private var undoBannerShouldRender: Bool = false
+
+    /// Per-banner tick task — sleeps the visibility window then flips
+    /// `undoBannerShouldRender` false. Kept as state so repeated
+    /// reversible actions can cancel the prior tick and restart fresh.
+    @State private var undoBannerHideTask: Task<Void, Never>?
+
+    /// 5-second visibility window from PRD docs/prds/trust-and-failures.md.
+    private let undoBannerVisibilityWindowSeconds: TimeInterval = 5
+
     private let fullWelcomeMessage = "hey! i'm pace"
 
     private let navigationPointerPhrases = [
@@ -305,9 +321,33 @@ struct BlueCursorView: View {
                     value: triangleRotationDegrees
                 )
 
+            // Undo banner — appears for 5 seconds after every reversible
+            // mutation Pace executes (note created, mail draft started,
+            // reminder added, etc.). Tapping it submits `Undo.last` via
+            // the executor. See PRD docs/prds/trust-and-failures.md.
+            if let summary = companionManager.mostRecentReversibleActionSummary,
+               undoBannerShouldRender,
+               isCursorOnThisScreen {
+                PaceUndoBanner(
+                    summaryText: summary,
+                    onUndoTapped: {
+                        companionManager.triggerUndoLastMutation()
+                    }
+                )
+                .position(
+                    x: cursorPosition.x + 20,
+                    y: cursorPosition.y + 44
+                )
+                .transition(reduceMotion ? .identity : .opacity)
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: undoBannerShouldRender)
+            }
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
+        .onChange(of: companionManager.mostRecentReversibleActionAt) { newTimestamp in
+            scheduleUndoBannerVisibilityRefresh(triggeredAt: newTimestamp)
+        }
         .onAppear {
             // Snap to the avatar's current position immediately, then keep
             // tracking. The cursor stays parked next to the walking character;
@@ -392,6 +432,35 @@ struct BlueCursorView: View {
     private var arrowShouldBeVisible: Bool {
         guard buddyIsVisibleOnThisScreen else { return false }
         return buddyNavigationMode != .followingCursor
+    }
+
+    /// Flips `undoBannerShouldRender` true when a reversible action
+    /// has just fired, then schedules a single async task to flip it
+    /// back to false after the 5-second window. Repeated mutations
+    /// cancel the prior task and restart the timer.
+    private func scheduleUndoBannerVisibilityRefresh(triggeredAt: Date?) {
+        guard let triggeredAt else {
+            undoBannerShouldRender = false
+            undoBannerHideTask?.cancel()
+            undoBannerHideTask = nil
+            return
+        }
+        let elapsedSeconds = Date().timeIntervalSince(triggeredAt)
+        let remainingSeconds = undoBannerVisibilityWindowSeconds - elapsedSeconds
+        guard remainingSeconds > 0 else {
+            undoBannerShouldRender = false
+            return
+        }
+        undoBannerShouldRender = true
+        undoBannerHideTask?.cancel()
+        let hideAfterNanos = UInt64(remainingSeconds * 1_000_000_000)
+        let task = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: hideAfterNanos)
+            guard !Task.isCancelled else { return }
+            undoBannerShouldRender = false
+            companionManager.clearReversibleActionUndoState()
+        }
+        undoBannerHideTask = task
     }
 
     private func startTrackingCursor() {
@@ -789,6 +858,50 @@ class OverlayWindowManager {
         })
     }
 
+}
+
+// MARK: - Pace undo banner
+//
+// Small floating button that appears below the cursor for 5 seconds
+// after every reversible mutation Pace executes. Tapping it submits
+// `Undo.last` through the executor. Lives inside the existing
+// non-activating cursor overlay so it never steals focus.
+//
+// Visual style is intentionally muted (low-alpha background, no glow)
+// so it doesn't compete with the primary cursor pip.
+
+struct PaceUndoBanner: View {
+    let summaryText: String
+    let onUndoTapped: () -> Void
+
+    var body: some View {
+        Button(action: onUndoTapped) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.uturn.backward.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                Text("undo: \(summaryText)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.95))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.black.opacity(0.72))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+            )
+            .shadow(color: Color.black.opacity(0.35), radius: 4, x: 0, y: 1)
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
 }
 
 // (Onboarding-video player NSViewRepresentable removed — Pace no longer

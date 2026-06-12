@@ -43,6 +43,9 @@ struct CompanionPanelView: View {
                 turnHUDSection
                     .padding(.horizontal, 16)
 
+                replayLastSpokenReplySection
+                    .padding(.horizontal, 16)
+
                 Spacer()
                     .frame(height: 8)
 
@@ -368,6 +371,50 @@ struct CompanionPanelView: View {
     }
 
     // MARK: - Permissions Copy
+
+    // Reply-replay button shown for 30 seconds after every assistant
+    // turn finishes speaking. See PRD docs/prds/trust-and-failures.md.
+    // Driven entirely by the manager's `lastSpokenReplyAt` timestamp;
+    // a per-second TimelineView keeps the visibility window honest
+    // without subscribing to a dedicated clock.
+    @ViewBuilder
+    private var replayLastSpokenReplySection: some View {
+        if let lastSpokenReplyAt = companionManager.lastSpokenReplyAt,
+           companionManager.lastSpokenReplyText?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            TimelineView(.periodic(from: lastSpokenReplyAt, by: 1)) { context in
+                let elapsedSeconds = context.date.timeIntervalSince(lastSpokenReplyAt)
+                let replayWindowSeconds: TimeInterval = 30
+                if elapsedSeconds < replayWindowSeconds {
+                    Button(action: {
+                        companionManager.replayLastSpokenReply()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "speaker.wave.2.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                            Text("Replay last reply")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule()
+                                .fill(Color.white.opacity(0.05))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                } else {
+                    EmptyView()
+                }
+            }
+        } else {
+            EmptyView()
+        }
+    }
 
     private var turnHUDSection: some View {
         HStack(alignment: .top, spacing: 8) {

@@ -107,6 +107,19 @@ final class LocalServerTTSClient: NSObject, BuddyTTSClient {
     private var audioPlayer: AVAudioPlayer?
     private var playbackContinuation: CheckedContinuation<Void, Never>?
     private var serverUnavailableUntil: Date?
+    /// Set true on the FIRST sidecar synthesis failure of the current
+    /// outage, cleared on next successful synthesis. CompanionManager
+    /// inspects this at end of turn to decide whether to speak the
+    /// templated sidecar-offline failure narration — see PRD
+    /// docs/prds/trust-and-failures.md.
+    private var didDetectSidecarOutageDuringCurrentSession: Bool = false
+
+    /// Public read of whether the Kokoro sidecar has failed at least
+    /// once since the last successful synthesis. Stays true across
+    /// turns until a successful synth clears it.
+    var hasObservedSidecarOutage: Bool {
+        didDetectSidecarOutageDuringCurrentSession
+    }
 
     init(
         configuration: LocalServerTTSConfiguration = .fromBundle(),
@@ -202,12 +215,16 @@ final class LocalServerTTSClient: NSObject, BuddyTTSClient {
                   (200..<300).contains(httpResponse.statusCode),
                   !audioData.isEmpty else {
                 auditSynthesis(outcome: "bad_response")
+                didDetectSidecarOutageDuringCurrentSession = true
                 return nil
             }
             auditSynthesis(outcome: "ok", outputByteCount: audioData.count)
+            // Successful synthesis — sidecar reachable again.
+            didDetectSidecarOutageDuringCurrentSession = false
             return audioData
         } catch {
             auditSynthesis(outcome: "transport_error")
+            didDetectSidecarOutageDuringCurrentSession = true
             return nil
         }
     }
