@@ -23,10 +23,39 @@ enum PaceToolPreflightSeverity: Equatable {
     }
 }
 
+/// Lightweight categorization of blocking preflight issues. Lets
+/// `CompanionManager` map preflight blocks onto a `PaceFailureKind`
+/// without re-parsing the issue title string. Keep this enum aligned
+/// with `PaceMissingPermissionKind` so the failure narrator can speak
+/// the right permission noun.
+nonisolated enum PaceToolPreflightBlockingKind: Equatable {
+    case actionsDisabled
+    case accessibilityPermissionMissing
+    case calendarPermissionMissing
+    case remindersPermissionMissing
+    case mcpServerNotConfigured(name: String)
+}
+
 struct PaceToolPreflightIssue: Equatable {
     let severity: PaceToolPreflightSeverity
     let title: String
     let repairHint: String
+    /// Optional typed kind so callers can map blocking issues onto
+    /// failure-narration enums without string parsing. Warnings leave
+    /// this `nil` because the manager only narrates blocking issues.
+    let blockingKind: PaceToolPreflightBlockingKind?
+
+    init(
+        severity: PaceToolPreflightSeverity,
+        title: String,
+        repairHint: String,
+        blockingKind: PaceToolPreflightBlockingKind? = nil
+    ) {
+        self.severity = severity
+        self.title = title
+        self.repairHint = repairHint
+        self.blockingKind = blockingKind
+    }
 
     static func formatForApproval(_ issues: [PaceToolPreflightIssue]) -> String? {
         let formattedIssues = formatLines(issues)
@@ -75,7 +104,8 @@ enum PaceToolPreflight {
             issues.append(PaceToolPreflightIssue(
                 severity: .blocking,
                 title: "Actions are disabled",
-                repairHint: "Set EnableActions=true in Info.plist, then rebuild."
+                repairHint: "Set EnableActions=true in Info.plist, then rebuild.",
+                blockingKind: .actionsDisabled
             ))
         }
 
@@ -85,7 +115,8 @@ enum PaceToolPreflight {
             issues.append(PaceToolPreflightIssue(
                 severity: .blocking,
                 title: "Accessibility permission missing",
-                repairHint: "Open Pace's panel and grant Accessibility."
+                repairHint: "Open Pace's panel and grant Accessibility.",
+                blockingKind: .accessibilityPermissionMissing
             ))
         }
 
@@ -94,7 +125,8 @@ enum PaceToolPreflight {
             issues.append(PaceToolPreflightIssue(
                 severity: .blocking,
                 title: "Calendar permission missing",
-                repairHint: "Use the Calendar row in Local Tools."
+                repairHint: "Use the Calendar row in Local Tools.",
+                blockingKind: .calendarPermissionMissing
             ))
         }
 
@@ -103,7 +135,8 @@ enum PaceToolPreflight {
             issues.append(PaceToolPreflightIssue(
                 severity: .blocking,
                 title: "Reminders permission missing",
-                repairHint: "Use the Reminders row in Local Tools."
+                repairHint: "Use the Reminders row in Local Tools.",
+                blockingKind: .remindersPermissionMissing
             ))
         }
 
@@ -123,11 +156,27 @@ enum PaceToolPreflight {
             issues.append(PaceToolPreflightIssue(
                 severity: .blocking,
                 title: "MCP server not configured: \(serverName)",
-                repairHint: "Add it to ~/.config/pace/mcp-servers.json."
+                repairHint: "Add it to ~/.config/pace/mcp-servers.json.",
+                blockingKind: .mcpServerNotConfigured(name: serverName)
             ))
         }
 
         return issues
+    }
+
+    /// Returns the FIRST blocking issue kind in the supplied list, or
+    /// `nil` if no blocking issues are present. The manager uses this
+    /// to map a preflight-blocked auto-execute path onto the right
+    /// `PaceFailureKind` for spoken narration without parsing strings.
+    static func firstBlockingIssueKind(
+        in issues: [PaceToolPreflightIssue]
+    ) -> PaceToolPreflightBlockingKind? {
+        for issue in issues where issue.severity == .blocking {
+            if let blockingKind = issue.blockingKind {
+                return blockingKind
+            }
+        }
+        return nil
     }
 
     private static func requiresAccessibilityPermission(_ action: PaceParsedAction) -> Bool {

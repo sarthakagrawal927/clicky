@@ -13,6 +13,22 @@ import SwiftUI
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
 
+    /// Bumped after each starter-prompt tap or dismiss so the card
+    /// re-reads `PaceStarterPromptStore` and shows the updated state
+    /// (checkmark, dismissed, auto-dismissed-after-4-tries). The store
+    /// is UserDefaults-backed so SwiftUI doesn't see writes otherwise.
+    @State private var starterPromptStateRevision: Int = 0
+
+    /// In-panel chat input draft text. Bound to the TextField shown
+    /// when the `cmd+shift+P` shortcut fires. Cleared on submit and
+    /// when the input dismisses (so a re-open starts blank).
+    @State private var notchChatDraftText: String = ""
+
+    /// Wires the TextField to the companion manager's notch-chat
+    /// focus flag so the global shortcut can move focus into the
+    /// field even when the panel is already on screen.
+    @FocusState private var isNotchChatInputFocused: Bool
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             panelHeader
@@ -28,7 +44,19 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
+                starterPromptCardSection
+                    .padding(.horizontal, 16)
+
+                morningBriefCardSection
+                    .padding(.horizontal, 16)
+
+                notchChatInputSection
+                    .padding(.horizontal, 16)
+
                 turnHUDSection
+                    .padding(.horizontal, 16)
+
+                replayLastSpokenReplySection
                     .padding(.horizontal, 16)
 
                 Spacer()
@@ -185,7 +213,290 @@ struct CompanionPanelView: View {
         .padding(.vertical, 14)
     }
 
+    // MARK: - Starter prompt card (first-run "Try these")
+
+    /// First-run "Try these" card. Pinned to the top of the panel for
+    /// the first 24h after the user first opens the panel with the card
+    /// visible, then auto-hides. Reads PaceStarterPromptStore for the
+    /// tried-set and the visibility decision; writes back through the
+    /// same store when the user taps a row or hides the card.
+    @ViewBuilder
+    private var starterPromptCardSection: some View {
+        // `starterPromptStateRevision` is referenced so SwiftUI re-runs
+        // this body after a tap or dismiss writes to UserDefaults. The
+        // explicit `_ = starterPromptStateRevision` would also work, but
+        // putting the read inside the visibility check is what actually
+        // drives the dependency tracking.
+        let _ = starterPromptStateRevision
+        if PaceStarterPromptStore.isVisible() {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 6) {
+                    Text("Try these")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Spacer(minLength: 0)
+
+                    Button(action: dismissStarterPromptCard) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .frame(width: 20, height: 20)
+                            .background(
+                                Circle().fill(Color.white.opacity(0.05))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                    .help("Hide for now")
+                }
+
+                VStack(spacing: 4) {
+                    ForEach(PaceStarterPromptCatalog.all) { starterPrompt in
+                        starterPromptRow(starterPrompt: starterPrompt)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.045))
+            )
+            .padding(.bottom, 8)
+            .onAppear {
+                PaceStarterPromptStore.markFirstSeenIfNeeded()
+            }
+        }
+    }
+
+    private func starterPromptRow(starterPrompt: PaceStarterPrompt) -> some View {
+        let hasTried = PaceStarterPromptStore.hasTried(slug: starterPrompt.slug)
+        return HStack(alignment: .center, spacing: 8) {
+            Image(systemName: hasTried ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(hasTried ? DS.Colors.success : DS.Colors.textTertiary)
+                .frame(width: 14)
+
+            Text(starterPrompt.displayText)
+                .font(.system(size: 11))
+                .foregroundColor(hasTried ? DS.Colors.textTertiary : DS.Colors.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+
+            Button(action: {
+                submitStarterPrompt(starterPrompt: starterPrompt)
+            }) {
+                Text("ask")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(Color.white.opacity(0.08))
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .help("Ask Pace this — same path as voice or chat.")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func submitStarterPrompt(starterPrompt: PaceStarterPrompt) {
+        // The store is updated BEFORE submission so the checkmark
+        // appears immediately. Even if the planner call fails, the
+        // user clearly tried this prompt.
+        PaceStarterPromptStore.markTried(slug: starterPrompt.slug)
+        starterPromptStateRevision += 1
+        companionManager.submitChatTranscriptFromDeepLink(starterPrompt.displayText)
+    }
+
+    private func dismissStarterPromptCard() {
+        PaceStarterPromptStore.markDismissed()
+        starterPromptStateRevision += 1
+    }
+
+    // MARK: - Morning brief card
+
+    /// Calm full-width card pinned to the top of the panel whenever the
+    /// morning-brief scheduler has a queued brief waiting for the user.
+    /// Renders nothing when there is no pending card so the panel stays
+    /// quiet on a normal day.
+    @ViewBuilder
+    private var morningBriefCardSection: some View {
+        if let pendingMorningBriefCard = companionManager.morningTriageScheduler.pendingMorningBriefCard {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center, spacing: 6) {
+                    Text("Morning brief")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    Spacer(minLength: 0)
+
+                    Button(action: {
+                        companionManager.playPendingMorningBrief()
+                    }) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.textSecondary)
+                            .frame(width: 20, height: 20)
+                            .background(
+                                Circle().fill(Color.white.opacity(0.07))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                    .help("Speak the brief now")
+
+                    Button(action: {
+                        companionManager.morningTriageScheduler.dismissPendingCard()
+                    }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .frame(width: 20, height: 20)
+                            .background(
+                                Circle().fill(Color.white.opacity(0.05))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                    .help("Dismiss")
+                }
+
+                Text(pendingMorningBriefCard)
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.045))
+            )
+            .padding(.bottom, 8)
+        }
+    }
+
     // MARK: - Permissions Copy
+
+    // Reply-replay button shown for 30 seconds after every assistant
+    // turn finishes speaking. See PRD docs/prds/trust-and-failures.md.
+    // Driven entirely by the manager's `lastSpokenReplyAt` timestamp;
+    // a per-second TimelineView keeps the visibility window honest
+    // without subscribing to a dedicated clock.
+    @ViewBuilder
+    private var replayLastSpokenReplySection: some View {
+        if let lastSpokenReplyAt = companionManager.lastSpokenReplyAt,
+           companionManager.lastSpokenReplyText?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            TimelineView(.periodic(from: lastSpokenReplyAt, by: 1)) { context in
+                let elapsedSeconds = context.date.timeIntervalSince(lastSpokenReplyAt)
+                let replayWindowSeconds: TimeInterval = 30
+                if elapsedSeconds < replayWindowSeconds {
+                    Button(action: {
+                        companionManager.replayLastSpokenReply()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "speaker.wave.2.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                            Text("Replay last reply")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule()
+                                .fill(Color.white.opacity(0.05))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+                } else {
+                    EmptyView()
+                }
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    /// Compact chat input that pops up inside the notch panel when the
+    /// global `cmd+shift+P` shortcut fires. Enter submits through the
+    /// same `submitChatTranscriptFromDeepLink(_:)` hook as voice and
+    /// the main window chat; Esc dismisses. After submission the
+    /// existing `turnHUDSection` below takes over for the streaming
+    /// reply — the notch is intentionally too small to host a full
+    /// chat scrollback.
+    @ViewBuilder
+    private var notchChatInputSection: some View {
+        if companionManager.isNotchChatInputFocused {
+            HStack(spacing: 6) {
+                TextField(
+                    "Ask Pace — Enter to send, Esc to cancel",
+                    text: $notchChatDraftText
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textPrimary)
+                .focused($isNotchChatInputFocused)
+                .onSubmit(submitNotchChatDraftText)
+                .onExitCommand { dismissNotchChatInput() }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.07))
+                )
+
+                Button(action: submitNotchChatDraftText) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(notchChatDraftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                         ? DS.Colors.textTertiary
+                                         : DS.Colors.textPrimary)
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(notchChatDraftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Send to Pace")
+            }
+            .onAppear {
+                isNotchChatInputFocused = true
+            }
+            // Mirror the manager-published flag into the local
+            // FocusState so the global shortcut can re-focus an
+            // already-visible field (FocusState only changes when its
+            // boolean transitions, so we coalesce both directions).
+            .onChange(of: companionManager.isNotchChatInputFocused) { newValue in
+                isNotchChatInputFocused = newValue
+            }
+        }
+    }
+
+    private func submitNotchChatDraftText() {
+        let trimmedDraftText = notchChatDraftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedDraftText.isEmpty else { return }
+        companionManager.submitChatTranscriptFromDeepLink(trimmedDraftText)
+        notchChatDraftText = ""
+        companionManager.dismissNotchChatInputAfterSubmit()
+        isNotchChatInputFocused = false
+    }
+
+    private func dismissNotchChatInput() {
+        notchChatDraftText = ""
+        companionManager.dismissNotchChatInputAfterSubmit()
+        isNotchChatInputFocused = false
+    }
 
     private var turnHUDSection: some View {
         HStack(alignment: .top, spacing: 8) {

@@ -22,7 +22,10 @@ LM_STUDIO_API_BASE="http://localhost:1234/v1"
 
 # Models we want present + loaded. These names are what `lms` resolves
 # against — append `@variant` if you need a specific quantization.
-PLANNER_MODEL_NAME="qwen/qwen3-30b-a3b"
+# Gemma-3-12B-it (qat-4bit MLX, ~8 GB): won the 2026-06-12 tinygpt
+# drilldown — only model ≤14B beating the 4B baseline on all three
+# unhappy-path dims (ambig 22%, oos 82%, destructive 77%).
+PLANNER_MODEL_NAME="google/gemma-3-12b"
 PLANNER_CONTEXT_LENGTH=8192
 # UI-Venus-1.5-8B is the GUI specialist this build defaults to. It
 # isn't in LM Studio's curated hub, so we grab it directly from the
@@ -167,6 +170,10 @@ ensure_vlm_available() {
 }
 
 ensure_models_loaded() {
+    download_model_if_missing "$PLANNER_MODEL_NAME" || {
+        print_fail "Planner model $PLANNER_MODEL_NAME could not be downloaded."
+        exit 1
+    }
     print_step "Loading planner ($PLANNER_MODEL_NAME) with ${PLANNER_CONTEXT_LENGTH} context..."
     "$LM_STUDIO_BIN" load "$PLANNER_MODEL_NAME" --context-length "$PLANNER_CONTEXT_LENGTH" 2>&1 | tail -2
     print_step "Loading VLM (ui-venus-1.5-8b)..."
@@ -185,7 +192,7 @@ print_loaded_models_and_suggested_info_plist_values() {
     printf "\n"
 
     print_step "Info.plist identifiers to confirm match what's loaded:"
-    echo "    LocalPlannerModelIdentifier  → whatever ID appears for your 30B-A3B planner in the /v1/models output above"
+    echo "    LocalPlannerModelIdentifier  → whatever ID appears for your Gemma-3-12B planner in the /v1/models output above (expected: google/gemma-3-12b)"
     echo "    LocalVLMModelIdentifier      → whatever ID appears for your vision model"
     echo "    (If the IDs in leanring-buddy/Info.plist don't match exactly, update them before Cmd+R.)"
 }

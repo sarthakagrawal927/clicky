@@ -36,13 +36,13 @@ The detailed manual steps below explain what the script does and what to tweak.
 1. Download LM Studio from <https://lmstudio.ai>.
 2. In the search tab, download:
    - A vision model: `Qwen3-VL-8B-Instruct` (recommended ~6GB) or `Qwen3-VL-4B-Instruct` (~3GB).
-   - A reasoner: `Qwen3-30B-A3B-Thinking-2507` (recommended ~18GB at Q4 — MoE, only 3B params active so it inferences fast despite the size). Smaller fallback: `Qwen3-4B-Instruct` (~2.5GB).
+   - A planner: `google/gemma-3-12b` (recommended — the qat-4bit MLX build, ~8GB; eval-validated default, see table below). Smaller fallback: `Qwen3-4B-Instruct` (~2.5GB).
 3. Go to **Developer** tab → **Start server** (default port 1234). LM Studio can host multiple models on the same port; load both the VLM and the reasoner. Make sure the identifiers match `LocalVLMModelIdentifier` and `LocalPlannerModelIdentifier` in Info.plist.
 
 Verify the server is up and both models are listed:
 
 ```bash
-curl -s http://localhost:1234/v1/models | grep -E "qwen3-vl|qwen3-30b|qwen3-4b"
+curl -s http://localhost:1234/v1/models | grep -E "ui-venus|qwen3-vl|gemma-3-12b|qwen3-4b"
 ```
 
 ## 2. Flip the Info.plist switches
@@ -56,7 +56,7 @@ curl -s http://localhost:1234/v1/models | grep -E "qwen3-vl|qwen3-30b|qwen3-4b"
 | `LocalVLMModelIdentifier` | `ui-venus-1.5-8b` | same | Must match the VLM model loaded in LM Studio. Default is UI-Venus-1.5-8B (GUI specialist built on Qwen3-VL, mlx-community 4-bit). |
 | `AlwaysRunLocalVLMRegardlessOfTranscript` | `false` | `true` | Forces the VLM to run on every turn even when the transcript looks like pure Q&A. Default off — the VLM-skip heuristic saves perception cost on "what is HTML" style queries. |
 | `LocalPlannerBaseURL` | `http://localhost:1234/v1` | same | OpenAI-compatible root for the local reasoner. Often the same LM Studio server as the VLM. |
-| `LocalPlannerModelIdentifier` | `qwen/qwen3-14b` | same | Dense 14B is the default — leaner RAM than the 30B MoE despite being "smaller". Swap up (`qwen/qwen3-30b-a3b`, `gpt-oss-20b`) when you want stronger multi-step reasoning, down (`qwen3-4b-instruct`) on tighter hardware. Load with `--num-parallel 1` for the lowest KV-cache footprint. |
+| `LocalPlannerModelIdentifier` | `google/gemma-3-12b` | same | Gemma-3-12B-it (qat-4bit, ~8 GB) is the eval-validated default — only model ≤14B that beat the 4B baseline on all three unhappy-path eval dimensions (clarify / out-of-scope / destructive-confirm, 2026-06-12 drilldown). Swap down (`qwen3-4b-instruct`) on tighter hardware. Load with `--num-parallel 1` for the lowest KV-cache footprint. |
 | `LocalTTSVoiceIdentifier` | `com.apple.voice.compact.en-IN.Rishi` | Apple voice identifier | Explicit voice override. Install a Premium or Enhanced voice and put its identifier here for the best local sound. |
 | `LocalTTSSpeechRate` | `0.44` | `0.35`-`0.58` | Pace's AVSpeechSynthesizer rate. The default is slower than stock so compact voices sound less rushed. |
 | `LocalTTSPitchMultiplier` | `0.88` | `0.75`-`1.15` | Lowers compact voices so the response is less sharp. |
@@ -225,12 +225,12 @@ Q3 keeps most of the grounding quality at ~75% of Q4's size. ANE doesn't acceler
 
 **Reasoner sizing.** Point `LocalPlannerModelIdentifier` at any OpenAI-compatible model loaded in LM Studio. Suggested tiers:
 
-| Model | Params (active) | RAM at Q4 | When to pick it |
+| Model | Params (active) | RAM | When to pick it |
 |---|---|---|---|
-| `qwen3-30b-a3b-thinking-2507` | 30B (3B active, MoE) | ~18 GB | **Default.** Qwen3's MoE thinking model — strong agent reasoning, fast inference, fits on 48 GB Macs alongside the VLM. |
-| `gpt-oss-20b` | 20B (3.6B active, MoE) | ~13 GB | OpenAI's open-weights MoE, similar tier, slightly tighter footprint. Apache-2.0. |
-| `phi-4-reasoning-14b` | 14B dense | ~9 GB | When you want frontier-ish reasoning on tighter hardware (32 GB Macs). |
-| `qwen3-4b-instruct` | 4B dense | ~2.5 GB | Lower-end devices (8-16 GB). Expect noticeably weaker multi-step agent quality. |
+| `google/gemma-3-12b` | 12B dense (qat-4bit) | ~8 GB | **Default.** Eval-validated 2026-06-12: only model ≤14B beating Qwen3-4B on all three unhappy-path dims (clarify, out-of-scope, destructive-confirm). |
+| `qwen3-30b-a3b-thinking-2507` | 30B (3B active, MoE) | ~18 GB | Strongest multi-step agent reasoning if you have 48 GB. Thinking-mode latency cost on every turn. |
+| `gpt-oss-20b` | 20B (3.6B active, MoE) | ~13 GB | OpenAI's open-weights MoE, A/B alternative. Apache-2.0. |
+| `qwen3-4b-instruct` | 4B dense | ~2.5 GB | Lower-end devices (8-16 GB). Holds up on out-of-scope refusals (78%) but never asks clarifying questions. |
 | `phi-4-mini-reasoning` | ~3.8B dense | ~2.5 GB | Smallest viable. Equivalent tier to Qwen3-4B. |
 
 Thinking-mode models emit `<think>…</think>` blocks; `LocalPlannerClient.stripThinkingBlocks` removes them before TTS and action-tag parsing, so you get the post-thought answer cleanly.

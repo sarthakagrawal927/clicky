@@ -86,6 +86,47 @@ final class CompanionManager: ObservableObject {
         .rootPaths(for: PaceLocalRetrievalFileRootPreferences.userSelectedRootURLs())
     @Published private(set) var currentTurnHUDState: PaceTurnHUDState = .idle
 
+    // MARK: - Trust surfaces (undo banner + reply replay)
+    //
+    // See PRD `docs/prds/trust-and-failures.md`. These three published
+    // fields drive the visible undo banner (cursor overlay) and the
+    // reply-replay button (notch panel). They are intentionally simple
+    // timestamp + payload pairs so SwiftUI views can compute "is the
+    // window still open?" without subscribing to a separate clock.
+
+    /// Timestamp of the most recent reversible action Pace executed
+    /// (a mutation from `PaceActionApprovalPolicy.actionIsReversibleMutation`).
+    /// The cursor overlay shows the undo banner when this is within
+    /// the last 5 seconds and `mostRecentReversibleActionSummary` is
+    /// set. Cleared explicitly by `clearReversibleActionUndoState()`.
+    @Published private(set) var mostRecentReversibleActionAt: Date?
+
+    /// Short summary of the most recent reversible action, used as the
+    /// undo-banner label (e.g. "Created note", "Started mail draft").
+    @Published private(set) var mostRecentReversibleActionSummary: String?
+
+    /// Post-processed spoken text from the most recent assistant turn.
+    /// Identical to what flowed through TTS — `<think>` blocks, tool
+    /// calls, action tags, and `[POINT:…]` already stripped. The reply
+    /// replay button replays exactly this text.
+    @Published private(set) var lastSpokenReplyText: String?
+
+    /// Timestamp of when `lastSpokenReplyText` was set. The notch
+    /// panel surfaces the replay button when this is within 30 seconds.
+    @Published private(set) var lastSpokenReplyAt: Date?
+
+    /// Latest plain-language failure narration Pace surfaced. Carried
+    /// on the manager so the panel can render the typed suggestion
+    /// (Settings deep-link, configure-MCP hint, etc.) without
+    /// re-deriving it from a stringly-typed history record.
+    @Published private(set) var lastFailureNarration: PaceFailureNarration?
+
+    /// Timestamp of the last sidecar-TTS-offline narration so the
+    /// "switched to system voice" message fires at most once per
+    /// outage window rather than on every sentence. Resets when the
+    /// sidecar recovers.
+    private var lastSidecarTTSOfflineNarratedAt: Date?
+
     private var pendingIntentClarification: PacePendingIntentClarification?
     let activeTTSVoiceSummary: PaceTTSVoiceSummary = PaceTTSVoiceSummary.current()
 
@@ -108,6 +149,16 @@ final class CompanionManager: ObservableObject {
 
     let buddyDictationManager = PacePushToTalkManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
+    /// System-wide listener for the chat-input shortcut (default
+    /// `cmd+shift+P`). Brings the notch panel forward and focuses the
+    /// chat input — the keystroke entry point for typists who don't
+    /// want to open the main window first.
+    let globalChatShortcutMonitor = GlobalChatShortcutMonitor()
+    /// Drives the chat input visibility inside the notch panel. Set
+    /// `true` when the chat shortcut fires; the panel renders a
+    /// TextField bound to `@FocusState` keyed on this flag. Cleared
+    /// once the input is submitted or dismissed.
+    @Published var isNotchChatInputFocused: Bool = false
     let overlayWindowManager = OverlayWindowManager()
 
     /// Tooltip-style bubble that follows the cursor and shows what's
@@ -129,9 +180,41 @@ final class CompanionManager: ObservableObject {
     /// reply, completed sentences get queued to AVSpeechSynthesizer
     /// before the response is finished generating — cuts perceived
     /// time-to-first-spoken-word from ~3s to ~500ms.
-    private lazy var streamingSentenceTTSPipeline: StreamingSentenceTTSPipeline = {
+    ///
+    /// `internal` access so the in-window chat surface can observe its
+    /// `@Published inFlightStreamedText` for live streaming display
+    /// without us routing the planner stream through a second publisher
+    /// in `CompanionManager`. The pipeline owns the per-turn lifecycle
+    /// already; reusing its publisher keeps the streaming wire-up DRY.
+    lazy var streamingSentenceTTSPipeline: StreamingSentenceTTSPipeline = {
         return StreamingSentenceTTSPipeline(ttsClient: ttsClient)
     }()
+
+    /// Backing store for the in-window chat transcript. Lazy so it
+    /// only builds the local history reader on first use (the main
+    /// window opens on demand, not at launch). Persistence runs
+    /// through `paceHistory` retrieval — there is no parallel chat
+    /// storage layer. See `PaceChatSession.swift`.
+    lazy var chatSession: PaceChatSession = {
+        return PaceChatSession(
+            historySource: PaceLocalChatHistoryReader(),
+            transcriptSubmitter: companionManagerChatSubmitterAdapter
+        )
+    }()
+
+    /// Adapter that lets `PaceChatSession` call back into the manager
+    /// without holding a strong reference. Forwards to
+    /// `submitChatTranscriptFromChatSession(_:)`, which is the chat-mode
+    /// twin of the deeplink submit path.
+    private lazy var companionManagerChatSubmitterAdapter: PaceChatSessionSubmitterAdapter = {
+        return PaceChatSessionSubmitterAdapter(owner: self)
+    }()
+
+    /// Per-turn flag set by `submitChatTranscriptFromChatSession` to the
+    /// session's `isChatTTSMuted` snapshot at submission time. The
+    /// streaming pipeline reads it through `setMutedForCurrentTurn`
+    /// every turn boundary; we don't store this anywhere persistent.
+    private var isChatModeMutedForCurrentTurn: Bool = false
 
     /// Classifies the user's transcript into pureKnowledge /
     /// screenDescription / screenAction / chitchat so the pipeline
@@ -276,7 +359,60 @@ final class CompanionManager: ObservableObject {
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
-    private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
+    ///
+    /// Thin facade over `threadMemory.verbatimWindow()` when thread
+    /// memory is enabled (the default). Existing unrelated callers
+    /// (smoke tests, debug logs) keep working; the source of truth is
+    /// the verbatim window inside `threadMemory`.
+    private var conversationHistory: [(userTranscript: String, assistantResponse: String)] {
+        return threadMemory.verbatimWindow().map { turnPair in
+            (userTranscript: turnPair.userText, assistantResponse: turnPair.assistantText)
+        }
+    }
+
+    /// Two-tier in-context memory: verbatim window of the last K
+    /// turn pairs + rolling summary of everything older. See PRD
+    /// docs/prds/conversational-thread-memory.md. Configured from
+    /// `PaceUserPreferencesStore` so the picker controls in Settings
+    /// can change the window size / idle threshold without a relaunch.
+    private lazy var threadMemory: PaceThreadMemory = {
+        let isEnabled = PaceUserPreferencesStore.bool(.isThreadMemoryEnabled, default: true)
+        let configuredVerbatimWindowSize = PaceUserPreferencesStore.clampedInt(
+            .threadMemoryVerbatimWindowSize,
+            default: 4,
+            in: 1...8
+        )
+        let configuredIdleMinutes = PaceUserPreferencesStore.clampedInt(
+            .threadMemoryIdleMinutes,
+            default: 20,
+            in: 5...60
+        )
+        // When the master switch is off we still construct the module
+        // (so the facade `conversationHistory` keeps working) but with
+        // a window size of 1 so nothing leaks into the planner beyond
+        // the immediate prior turn. Toggling back on just requires a
+        // relaunch — the next `start()` reads the preference fresh.
+        let effectiveWindowSize = isEnabled ? configuredVerbatimWindowSize : 1
+        return PaceThreadMemory(
+            configuration: PaceThreadMemoryConfiguration(
+                verbatimWindowSize: effectiveWindowSize,
+                sessionIdleThreshold: TimeInterval(configuredIdleMinutes) * 60,
+                summaryMaxTokenEstimate: PaceThreadMemoryConfiguration.default.summaryMaxTokenEstimate
+            )
+        )
+    }()
+
+    /// Detached FM call producing the next rolling summary. Lazy so
+    /// the FM session is created only when the first turn falls off
+    /// the verbatim window. See PRD section "Latency budget detail
+    /// (the race)" for the version-snapshot contract.
+    private lazy var threadSummarizerClient: PaceThreadSummarizerClient = {
+        PaceThreadSummarizerClientFactory.makeDefault()
+    }()
+
+    /// Low-frequency idle sweep so the menu-bar surface can drop
+    /// "session live" indicators without needing a new user turn.
+    private var threadMemoryIdleSweepTimer: Timer?
 
     /// Per-screen VLM analysis cache keyed by screen label (e.g.
     /// "primary focus", "screen 2"). Hash of the screenshot's JPEG
@@ -292,6 +428,7 @@ final class CompanionManager: ObservableObject {
     private var currentResponseTask: Task<Void, Never>?
 
     private var shortcutTransitionCancellable: AnyCancellable?
+    private var chatShortcutCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
@@ -424,6 +561,255 @@ final class CompanionManager: ObservableObject {
         PaceUserPreferencesStore.setBool(enabled, for: .requiresActionApproval)
     }
 
+    // MARK: - Cloud bridge published state
+
+    /// The user's chosen bridge routing mode. Persisted via `PaceCloudBridgeConsent`.
+    @Published private(set) var cloudBridgeMode: PaceCloudBridgeMode = {
+        PaceCloudBridgeConsent.loadConfiguration().mode
+    }()
+
+    /// Which CLI upstream the bridge should use (Claude Code / Codex / Gemini).
+    @Published private(set) var cloudBridgeUpstream: PaceCloudBridgeUpstream = {
+        PaceCloudBridgeConsent.loadConfiguration().upstream
+    }()
+
+    /// Model identifier string forwarded to the bridge (e.g. "sonnet").
+    @Published private(set) var cloudBridgeModel: String = {
+        PaceCloudBridgeConsent.loadConfiguration().model
+    }()
+
+    /// Set to true when a cloud-bridge SSE stream is actively in progress.
+    /// Observed by `PaceMenuBarOverlay` to tint the right-icon slot amber.
+    @Published private(set) var isCloudBridgeCallActive: Bool = false
+
+    // MARK: - Planner tier picker state
+
+    /// The user's chosen planner tier from Settings → Planner. Default is
+    /// `.local` for existing users — no UserDefaults state means the
+    /// factory returns the same LM Studio planner as before.
+    @Published private(set) var activePlannerTier: PacePlannerTier = {
+        PacePlannerTierStore.loadConfiguration().tier
+    }()
+
+    /// The provider Direct-API turns will target when tier == .directAPI.
+    @Published private(set) var directAPIProvider: PaceDirectAPIProvider = {
+        PacePlannerTierStore.loadConfiguration().directAPIProvider
+    }()
+
+    /// The model identifier sent in the Direct-API request body.
+    @Published private(set) var directAPIModelIdentifier: String = {
+        PacePlannerTierStore.loadConfiguration().directAPIModelIdentifier
+    }()
+
+    /// The user-pasted endpoint URL string, used only when provider == .custom.
+    @Published private(set) var directAPICustomEndpointURLString: String = {
+        PacePlannerTierStore.loadConfiguration().directAPICustomEndpointURLString
+    }()
+
+    /// Opt-in: when true AND a Direct-API turn errors, Pace retries the
+    /// SAME turn against LM Studio. Default is OFF so failures fail loud.
+    @Published private(set) var directAPIFallsBackToLocalOnCloudFailure: Bool = {
+        PacePlannerTierStore.loadConfiguration().fallsBackToLocalOnCloudFailure
+    }()
+
+    /// True when ANY non-Local tier (cliBridge OR directAPI) is actively
+    /// streaming. The menu-bar capsule observes this for the amber tint
+    /// so EVERY off-device turn is visible, not just bridge calls.
+    /// `isCloudBridgeCallActive` remains as a subset for backward compat
+    /// during the v1 cycle and continues to set/reset alongside this flag.
+    @Published private(set) var isOffDeviceTurnInFlight: Bool = false
+
+    func setActivePlannerTier(_ newTier: PacePlannerTier) {
+        activePlannerTier = newTier
+        PacePlannerTierStore.saveTier(newTier)
+        // Rebuild planner so the next turn uses the freshly-picked tier
+        // without requiring an app restart.
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setDirectAPIProvider(_ newProvider: PaceDirectAPIProvider) {
+        directAPIProvider = newProvider
+        PacePlannerTierStore.saveDirectAPIProvider(newProvider)
+        // When the provider changes, also seed the model field with that
+        // provider's default — the user can immediately overwrite it but
+        // most users want a sensible starting model identifier.
+        let savedModelForProvider = PacePlannerTierStore.loadConfiguration().directAPIModelIdentifier
+        let modelIdentifierLooksEmptyOrStale = savedModelForProvider
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        if modelIdentifierLooksEmptyOrStale {
+            setDirectAPIModelIdentifier(newProvider.defaultModelIdentifier)
+        }
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setDirectAPIModelIdentifier(_ newModelIdentifier: String) {
+        directAPIModelIdentifier = newModelIdentifier
+        PacePlannerTierStore.saveDirectAPIModelIdentifier(newModelIdentifier)
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setDirectAPICustomEndpointURLString(_ newCustomEndpointURLString: String) {
+        directAPICustomEndpointURLString = newCustomEndpointURLString
+        PacePlannerTierStore.saveDirectAPICustomEndpointURL(newCustomEndpointURLString)
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setDirectAPIFallsBackToLocalOnCloudFailure(_ enabled: Bool) {
+        directAPIFallsBackToLocalOnCloudFailure = enabled
+        PacePlannerTierStore.saveFallsBackToLocalOnCloudFailure(enabled)
+    }
+
+    /// Whether the active planner tier is one that leaves the Mac.
+    /// Cliff-edge gates: cliBridge requires consent AND a non-off mode;
+    /// directAPI requires a stored key. Both checks mirror the factory
+    /// so the UI flag stays honest.
+    var activePlannerTierIsOffDevice: Bool {
+        switch activePlannerTier {
+        case .local, .appleFoundationModels:
+            return false
+        case .cliBridge:
+            let bridgeConfiguration = PaceCloudBridgeConsent.loadConfiguration()
+            return bridgeConfiguration.hasUserAcceptedConsent
+                && bridgeConfiguration.mode != .off
+        case .directAPI:
+            return PaceKeychainStore.loadAPIKey(for: directAPIProvider) != nil
+        }
+    }
+
+    /// Verifies that the configured Direct-API provider, model, and key
+    /// can complete a single round trip. Builds a one-off
+    /// `DirectAPIPlannerClient` rather than reusing the active
+    /// `plannerClient` so the test does not disturb live state and is
+    /// not blocked by the tier choice. Surfaces the upstream error
+    /// verbatim on failure — users debugging API issues need to see the
+    /// provider's actual error string to find it in provider docs.
+    func runDirectAPITestRoundTrip() async -> Result<String, Error> {
+        let configurationAtTestTime = PacePlannerTierStore.loadConfiguration()
+        let resolvedEndpointURLString = PacePlannerTierStore
+            .resolvedDirectAPIEndpointURLString(for: configurationAtTestTime)
+
+        let validatedEndpointURL: URL
+        do {
+            validatedEndpointURL = try PaceLocalEndpointGuard.validatedDirectAPIURL(
+                from: resolvedEndpointURLString
+            )
+        } catch {
+            return .failure(error)
+        }
+
+        let testOnlyPlannerClient = DirectAPIPlannerClient(
+            provider: configurationAtTestTime.directAPIProvider,
+            endpointURL: validatedEndpointURL,
+            modelIdentifier: configurationAtTestTime.directAPIModelIdentifier
+        )
+
+        do {
+            let (responseText, _) = try await testOnlyPlannerClient.generateResponseStreaming(
+                images: [],
+                systemPrompt: "You are a connectivity-test echo. Respond with the model identifier you are, in exactly one word.",
+                conversationHistory: [],
+                userPrompt: "hi",
+                onTextChunk: { _ in }
+            )
+            let trimmedResponseText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .success(String(trimmedResponseText.prefix(60)))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// Stores the user-pasted API key for the active Direct-API provider
+    /// and rebuilds the planner so the new key is picked up on the next
+    /// turn. The key value is passed straight to `PaceKeychainStore` and
+    /// is never persisted anywhere else.
+    @discardableResult
+    func saveDirectAPIKey(_ apiKey: String, for provider: PaceDirectAPIProvider) -> Bool {
+        let didStore = PaceKeychainStore.storeAPIKey(apiKey, for: provider)
+        if didStore {
+            plannerClient = BuddyPlannerClientFactory.makeDefault()
+        }
+        return didStore
+    }
+
+    /// Removes the stored API key for the given provider and rebuilds the
+    /// planner so the next turn either falls back to local (when no other
+    /// key is present) or picks up a different stored provider.
+    @discardableResult
+    func deleteDirectAPIKey(for provider: PaceDirectAPIProvider) -> Bool {
+        let didDelete = PaceKeychainStore.deleteAPIKey(for: provider)
+        if didDelete {
+            plannerClient = BuddyPlannerClientFactory.makeDefault()
+        }
+        return didDelete
+    }
+
+    /// Snapshot of which providers currently have an API key in Keychain.
+    /// Settings UI calls this to show a green checkmark next to a saved
+    /// provider.
+    func providersWithStoredDirectAPIKeys() -> Set<PaceDirectAPIProvider> {
+        return PaceKeychainStore.providersWithStoredKeys()
+    }
+
+    func setCloudBridgeMode(_ mode: PaceCloudBridgeMode) {
+        cloudBridgeMode = mode
+        PaceCloudBridgeConsent.saveMode(mode)
+        // Rebuild the planner so the new mode takes effect on the next turn
+        // without requiring an app restart.
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setCloudBridgeUpstream(_ upstream: PaceCloudBridgeUpstream) {
+        cloudBridgeUpstream = upstream
+        PaceCloudBridgeConsent.saveUpstream(upstream)
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    func setCloudBridgeModel(_ model: String) {
+        cloudBridgeModel = model
+        PaceCloudBridgeConsent.saveModel(model)
+        plannerClient = BuddyPlannerClientFactory.makeDefault()
+    }
+
+    /// Shows the one-time cloud-bridge consent NSAlert.
+    /// Returns true if the user tapped "Use the bridge", false if they cancelled.
+    /// Persists acceptance via `PaceCloudBridgeConsent.acceptConsent()` on approval.
+    func requestCloudBridgeConsentIfNeeded() -> Bool {
+        let currentConfiguration = PaceCloudBridgeConsent.loadConfiguration()
+        guard !currentConfiguration.hasUserAcceptedConsent else {
+            // Already accepted — no dialog needed.
+            return true
+        }
+
+        let consentAlert = NSAlert()
+        consentAlert.alertStyle = .warning
+        consentAlert.messageText = "Send data outside Pace?"
+        consentAlert.informativeText = """
+The cloud bridge sends your transcript and the planner system \
+prompt to the upstream CLI you choose (Claude Code, Codex, or \
+Gemini CLI), which in turn calls Anthropic, OpenAI, or Google \
+servers respectively. Their data-handling policies apply.
+
+Pace will show an indicator in the menu-bar capsule whenever a \
+bridge call is in flight. Push-to-talk text-only turns still \
+default to your local planner; the bridge is used only for \
+turns Pace would otherwise refuse as "too hard locally."
+
+You can turn this off at any time in Settings → Cloud bridge.
+"""
+        consentAlert.addButton(withTitle: "Use the bridge")
+        consentAlert.addButton(withTitle: "Keep local only")
+
+        NSApp.activate(ignoringOtherApps: true)
+        let userResponse = consentAlert.runModal()
+        let userAccepted = userResponse == .alertFirstButtonReturn
+
+        if userAccepted {
+            PaceCloudBridgeConsent.acceptConsent()
+        }
+        return userAccepted
+    }
+
     @Published var isAlwaysListeningEnabled: Bool = PaceUserPreferencesStore
         .bool(.isAlwaysListeningEnabled, default: false)
 
@@ -454,6 +840,299 @@ final class CompanionManager: ObservableObject {
     func setWatchObservationNudgesEnabled(_ enabled: Bool) {
         areWatchObservationNudgesEnabled = enabled
         PaceUserPreferencesStore.setBool(enabled, for: .areWatchObservationNudgesEnabled)
+    }
+
+    // MARK: - Morning triage (daily brief)
+
+    /// User-facing master switch for the daily weekday morning brief.
+    /// Default OFF — the scheduler stays inert until the user
+    /// explicitly enables this in Settings. See PRD
+    /// docs/prds/morning-triage.md.
+    @Published var isMorningTriageEnabled: Bool = PaceUserPreferencesStore
+        .bool(.isMorningTriageEnabled, default: false)
+
+    func setMorningTriageEnabled(_ enabled: Bool) {
+        isMorningTriageEnabled = enabled
+        PaceUserPreferencesStore.setBool(enabled, for: .isMorningTriageEnabled)
+        if enabled {
+            morningTriageScheduler.start()
+        } else {
+            morningTriageScheduler.stop()
+        }
+    }
+
+    /// Hour-of-day at which the brief fires on weekdays. Clamped 0...23
+    /// on read so a corrupted UserDefaults value can't break the timer.
+    @Published var morningTriageHourOfDay: Int = PaceUserPreferencesStore
+        .clampedInt(.morningTriageHourOfDay, default: 8, in: 0...23)
+
+    func setMorningTriageHourOfDay(_ hourOfDay: Int) {
+        let clampedHourOfDay = min(max(hourOfDay, 0), 23)
+        morningTriageHourOfDay = clampedHourOfDay
+        PaceUserPreferencesStore.setInt(clampedHourOfDay, for: .morningTriageHourOfDay)
+        morningTriageScheduler.setFireTime(
+            hourOfDay: clampedHourOfDay,
+            minuteOfHour: morningTriageMinuteOfHour
+        )
+    }
+
+    /// Minute-of-hour at which the brief fires. Clamped 0...59 on read.
+    @Published var morningTriageMinuteOfHour: Int = PaceUserPreferencesStore
+        .clampedInt(.morningTriageMinuteOfHour, default: 30, in: 0...59)
+
+    func setMorningTriageMinuteOfHour(_ minuteOfHour: Int) {
+        let clampedMinuteOfHour = min(max(minuteOfHour, 0), 59)
+        morningTriageMinuteOfHour = clampedMinuteOfHour
+        PaceUserPreferencesStore.setInt(clampedMinuteOfHour, for: .morningTriageMinuteOfHour)
+        morningTriageScheduler.setFireTime(
+            hourOfDay: morningTriageHourOfDay,
+            minuteOfHour: clampedMinuteOfHour
+        )
+    }
+
+    /// Scheduler instance that owns the daily fire timer and the
+    /// pending-card surface. Lazy so it captures the lazy retriever /
+    /// ttsClient without forcing them on app launch when the feature
+    /// is off.
+    lazy var morningTriageScheduler: PaceMorningTriageScheduler = {
+        let scheduler = PaceMorningTriageScheduler(
+            retriever: localRetriever,
+            ttsClient: ttsClient,
+            inputsProvider: { [weak self] context in
+                guard let self else {
+                    return PaceMorningBriefInputs(now: context.now)
+                }
+                return self.buildMorningBriefInputs(forNow: context.now)
+            },
+            restraintContextProvider: { [weak self] context in
+                guard let self else {
+                    return PaceRestraintContext(
+                        now: context.now,
+                        lastProactiveUtteranceAt: nil,
+                        lastEpisodicRecallAt: nil,
+                        lastUserInputAt: nil,
+                        frontmostAppBundleIdentifier: nil,
+                        isOnActiveCall: false,
+                        wakeWordConfidence: nil,
+                        intent: .pureKnowledge,
+                        proactiveSource: .morningTriage
+                    )
+                }
+                return self.buildMorningTriageRestraintContext(forNow: context.now)
+            }
+        )
+        scheduler.setFireTime(
+            hourOfDay: morningTriageHourOfDay,
+            minuteOfHour: morningTriageMinuteOfHour
+        )
+        return scheduler
+    }()
+
+    /// Pulls compact typed inputs from currently-indexed retrieval
+    /// documents. Calendar / mail / reminders / app-usage all come
+    /// from the same retriever the rest of the app uses, so the brief
+    /// degrades gracefully to whatever is enabled without crashing.
+    private func buildMorningBriefInputs(forNow now: Date) -> PaceMorningBriefInputs {
+        let calendarBriefEvents = todaysCalendarBriefEvents(forNow: now)
+        let (unreadMailCount, topMailSender, topMailSubject) = morningMailSummary()
+        let (openRemindersDueToday, topReminderTitle, topReminderDueText) = morningRemindersSummary(forNow: now)
+        let (yesterdayTopApp, yesterdayTopAppMinutes) = yesterdayAppUsageSummary(forNow: now)
+        let yesterdayWatchHighlight = yesterdayWatchHighlightSummary(forNow: now)
+
+        return PaceMorningBriefInputs(
+            now: now,
+            userFirstName: nil,
+            todaysEvents: calendarBriefEvents,
+            unreadMailCount: unreadMailCount,
+            topMailSender: topMailSender,
+            topMailSubject: topMailSubject,
+            openRemindersDueToday: openRemindersDueToday,
+            topReminderTitle: topReminderTitle,
+            topReminderDueText: topReminderDueText,
+            yesterdayTopApp: yesterdayTopApp,
+            yesterdayTopAppMinutes: yesterdayTopAppMinutes,
+            yesterdayWatchHighlight: yesterdayWatchHighlight
+        )
+    }
+
+    /// Lightweight today-only view of indexed calendar events. We don't
+    /// hit EventKit here — the retriever already mirrors calendar state
+    /// through its per-source refresh, and the brief only needs title +
+    /// start time to compose the spoken paragraph.
+    private func todaysCalendarBriefEvents(forNow now: Date) -> [CalendarBriefEvent] {
+        guard localRetriever.isSourceEnabled(.calendar) else { return [] }
+        // The connector keeps the start date on the document's
+        // `modifiedAt` field, so we filter by same-day there to find
+        // today's events without re-parsing the indexed text body.
+        let calendarUserCalendar = Calendar.current
+        let documentsWithStartDate: [(document: PaceRetrievalDocument, startDate: Date)] = localRetriever
+            .documents(forSource: .calendar)
+            .compactMap { document in
+                guard let documentModifiedAt = document.modifiedAt else { return nil }
+                return (document, documentModifiedAt)
+            }
+            .filter { calendarUserCalendar.isDate($0.startDate, inSameDayAs: now) }
+            .sorted { $0.startDate < $1.startDate }
+        return documentsWithStartDate
+            .prefix(2)
+            .map { documentAndStartDate in
+                CalendarBriefEvent(
+                    title: documentAndStartDate.document.title,
+                    startDate: documentAndStartDate.startDate,
+                    isAllDay: false
+                )
+            }
+    }
+
+    /// Best-effort unread-mail summary. v1: counts indexed mail
+    /// documents touched in the last 18 hours. A v2 connector could
+    /// expose a richer typed snapshot.
+    private func morningMailSummary() -> (count: Int, topSender: String?, topSubject: String?) {
+        guard localRetriever.isSourceEnabled(.mail) else { return (0, nil, nil) }
+        let recentMailDocuments = localRetriever
+            .documents(forSource: .mail)
+            .sorted { firstDocument, secondDocument in
+                let firstModifiedAt = firstDocument.modifiedAt ?? .distantPast
+                let secondModifiedAt = secondDocument.modifiedAt ?? .distantPast
+                return firstModifiedAt > secondModifiedAt
+            }
+            .prefix(20)
+        let topDocument = recentMailDocuments.first
+        return (recentMailDocuments.count, nil, topDocument?.title)
+    }
+
+    /// Best-effort reminders summary. v1: counts indexed reminder
+    /// documents whose modifiedAt sits today.
+    private func morningRemindersSummary(forNow now: Date) -> (count: Int, topTitle: String?, topDueText: String?) {
+        guard localRetriever.isSourceEnabled(.reminders) else { return (0, nil, nil) }
+        let calendarUserCalendar = Calendar.current
+        let documentsWithDueDate: [(document: PaceRetrievalDocument, dueDate: Date)] = localRetriever
+            .documents(forSource: .reminders)
+            .compactMap { document in
+                guard let documentModifiedAt = document.modifiedAt else { return nil }
+                return (document, documentModifiedAt)
+            }
+            .filter { calendarUserCalendar.isDate($0.dueDate, inSameDayAs: now) }
+            .sorted { $0.dueDate < $1.dueDate }
+        let topPair = documentsWithDueDate.first
+        let topDueText: String?
+        if let topPairDueDate = topPair?.dueDate {
+            let dueDateFormatter = DateFormatter()
+            dueDateFormatter.dateStyle = .none
+            dueDateFormatter.timeStyle = .short
+            dueDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+            topDueText = "due at \(dueDateFormatter.string(from: topPairDueDate).lowercased())"
+        } else {
+            topDueText = nil
+        }
+        return (documentsWithDueDate.count, topPair?.document.title, topDueText)
+    }
+
+    /// Best-effort yesterday app-usage summary. We let the journal
+    /// formatter render its own line; the brief only needs the top
+    /// app name + minutes, so we parse the first usage line.
+    private func yesterdayAppUsageSummary(forNow now: Date) -> (topApp: String?, minutes: Int?) {
+        guard localRetriever.isSourceEnabled(.appUsageHistory) else { return (nil, nil) }
+        let calendarUserCalendar = Calendar.current
+        guard let yesterday = calendarUserCalendar.date(byAdding: .day, value: -1, to: now) else {
+            return (nil, nil)
+        }
+        let yesterdayUsageDocument = localRetriever
+            .documents(forSource: .appUsageHistory)
+            .first { document in
+                guard let documentModifiedAt = document.modifiedAt else { return false }
+                return calendarUserCalendar.isDate(documentModifiedAt, inSameDayAs: yesterday)
+            }
+        guard let yesterdayUsageDocumentText = yesterdayUsageDocument?.text else {
+            return (nil, nil)
+        }
+        return parseYesterdayTopAppUsageLine(yesterdayUsageDocumentText)
+    }
+
+    /// Pulls the top-app + minutes from the first usage line written
+    /// by `PaceAppUsageJournal`. Done as a tiny pure parser so it
+    /// can be unit-checked separately if the journal format changes.
+    private func parseYesterdayTopAppUsageLine(_ usageDocumentText: String) -> (topApp: String?, minutes: Int?) {
+        // The journal lines look like: "Xcode — 240 min · 14 switches".
+        // We only need the first meaningful line; the doc may include
+        // a date header on line 0.
+        let candidateLines = usageDocumentText
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        for candidateLine in candidateLines {
+            guard candidateLine.contains("min") else { continue }
+            let separatorRange = candidateLine.range(of: " — ")
+                ?? candidateLine.range(of: " - ")
+                ?? candidateLine.range(of: ":")
+            guard let separatorRange else { continue }
+            let topAppName = String(candidateLine[..<separatorRange.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            let remainderText = candidateLine[separatorRange.upperBound...]
+            guard let digitsStartIndex = remainderText.firstIndex(where: { $0.isNumber }) else {
+                continue
+            }
+            let digitsRemainder = remainderText[digitsStartIndex...]
+            let digitsEndIndex = digitsRemainder.firstIndex(where: { !$0.isNumber }) ?? digitsRemainder.endIndex
+            guard let parsedMinutes = Int(digitsRemainder[..<digitsEndIndex]) else { continue }
+            return (topAppName.isEmpty ? nil : topAppName, parsedMinutes)
+        }
+        return (nil, nil)
+    }
+
+    /// Best-effort yesterday watch-mode highlight. v1: returns the first
+    /// non-empty line from yesterday's watch-journal document.
+    private func yesterdayWatchHighlightSummary(forNow now: Date) -> String? {
+        guard localRetriever.isSourceEnabled(.screenWatchHistory) else { return nil }
+        let calendarUserCalendar = Calendar.current
+        guard let yesterday = calendarUserCalendar.date(byAdding: .day, value: -1, to: now) else {
+            return nil
+        }
+        let yesterdayWatchDocument = localRetriever
+            .documents(forSource: .screenWatchHistory)
+            .first { document in
+                guard let documentModifiedAt = document.modifiedAt else { return false }
+                return calendarUserCalendar.isDate(documentModifiedAt, inSameDayAs: yesterday)
+            }
+        return yesterdayWatchDocument?.title
+    }
+
+    /// Plays the queued morning-brief card aloud and clears it.
+    /// Wired to the small play button on the brief card so users who
+    /// missed the spoken brief can hear it on demand.
+    func playPendingMorningBrief() {
+        guard let pendingMorningBriefText = morningTriageScheduler.pendingMorningBriefCard else { return }
+        Task { @MainActor in
+            try? await self.ttsClient.speakText(pendingMorningBriefText)
+            self.morningTriageScheduler.dismissPendingCard()
+        }
+    }
+
+    /// User-initiated preview entry point used by Settings → "Send it now".
+    /// Wraps `morningTriageScheduler.deliverNowForTesting()` so the
+    /// SwiftUI button can call a synchronous-looking API.
+    func deliverMorningBriefPreviewNow() {
+        Task { @MainActor in
+            await self.morningTriageScheduler.deliverNowForTesting()
+        }
+    }
+
+    /// Builds the gate context for a morning-brief fire. Uses
+    /// conservative defaults — the gate's main job for this source
+    /// is the active-call check.
+    private func buildMorningTriageRestraintContext(forNow now: Date) -> PaceRestraintContext {
+        let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        return PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: nil,
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: frontmostBundleIdentifier,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .pureKnowledge,
+            proactiveSource: .morningTriage
+        )
     }
 
     @Published private(set) var isWatchModeEnabled: Bool = false
@@ -683,6 +1362,264 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Trust surfaces (undo banner + reply replay)
+
+    /// Returns the first click candidate's text label (if known) from
+    /// the supplied plan, used to make the click-missed narration
+    /// concrete ("I couldn't find a save button…"). Falls back to nil
+    /// for coordinate-only clicks; the narrator then emits generic
+    /// copy.
+    private static func firstClickCandidateLabel(
+        in actionExecutionPlan: PaceActionExecutionPlan
+    ) -> String? {
+        for action in actionExecutionPlan.flattenedActions {
+            if case .clickCandidates(let candidateSet) = action {
+                for candidate in candidateSet.candidates {
+                    if let label = candidate.label?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                       !label.isEmpty {
+                        return label
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Records that a reversible action just executed. Called from the
+    /// post-action site in the agent loop / fast-action path. The
+    /// cursor overlay observes the published fields and shows the
+    /// undo banner for the next 5 seconds.
+    private func noteReversibleActionExecuted(
+        in actionExecutionPlan: PaceActionExecutionPlan
+    ) {
+        guard PaceActionApprovalPolicy.planContainsReversibleMutation(actionExecutionPlan) else {
+            return
+        }
+        let summary = PaceActionApprovalPolicy.firstReversibleSummary(actionExecutionPlan)
+            ?? "Last action"
+        mostRecentReversibleActionSummary = summary
+        mostRecentReversibleActionAt = Date()
+    }
+
+    /// Test-friendly entry point that lets unit tests assert the
+    /// undo-banner flags after a synthetic plan. Has the same effect
+    /// as `noteReversibleActionExecuted` when called with a plan that
+    /// contains a reversible mutation.
+    func notePostActionExecutionForTrustSurface(
+        actionExecutionPlan: PaceActionExecutionPlan
+    ) {
+        noteReversibleActionExecuted(in: actionExecutionPlan)
+    }
+
+    /// Clears the undo-banner state. Called by the cursor overlay
+    /// after the 5-second window expires, or after the user taps
+    /// "undo" so the banner doesn't linger.
+    func clearReversibleActionUndoState() {
+        mostRecentReversibleActionAt = nil
+        mostRecentReversibleActionSummary = nil
+    }
+
+    /// Submits an `Undo.last` action through the executor. Called
+    /// from the cursor overlay's undo button. Runs out-of-band of the
+    /// planner loop because the user explicitly asked for undo.
+    func triggerUndoLastMutation() {
+        clearReversibleActionUndoState()
+        Task { @MainActor in
+            let undoPlan = PaceActionExecutionPlan.serial(actions: [.undoLastMutation])
+            let observations = await actionExecutor.executeActionPlan(
+                undoPlan,
+                screenCaptures: []
+            )
+            if !observations.isEmpty {
+                appendActionResult(.completed(observations: observations))
+            }
+        }
+    }
+
+    /// Notes that an assistant turn just finished speaking, so the
+    /// notch panel can render the reply-replay button for the next 30
+    /// seconds. The text passed in is the already-post-processed
+    /// spoken text (think blocks + action tags stripped), so replay
+    /// speaks the same syllables the user just missed.
+    private func noteLastSpokenReply(_ spokenText: String) {
+        let trimmedSpokenText = spokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSpokenText.isEmpty else { return }
+        lastSpokenReplyText = trimmedSpokenText
+        lastSpokenReplyAt = Date()
+    }
+
+    /// Clears the replay state. Called when a new turn begins so the
+    /// button never lingers past the next push-to-talk press.
+    private func clearLastSpokenReplyState() {
+        lastSpokenReplyText = nil
+        lastSpokenReplyAt = nil
+    }
+
+    /// Replays the most recent spoken reply through TTS. Wired to the
+    /// notch panel's replay button. Reuses the SAME text that already
+    /// went through TTS — doesn't re-stream the planner.
+    func replayLastSpokenReply() {
+        guard let textToReplay = lastSpokenReplyText?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !textToReplay.isEmpty else {
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await ttsClient.speakText(textToReplay)
+            } catch {
+                print("⚠️ Replay TTS failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Composes and speaks a plain-language failure message for one of
+    /// the documented `PaceFailureKind` cases. Flows through
+    /// `PaceRestraintGate.decide(...)` so failure speech respects
+    /// active-call mute and the proactive cooldown.
+    ///
+    /// `context` is a free-form short string used only as a debug
+    /// breadcrumb (e.g. "agent loop step 3") — never spoken.
+    func speakPlainLanguageFailure(
+        _ kind: PaceFailureKind,
+        context: String? = nil
+    ) {
+        let narration = PaceFailureNarrator.compose(kind)
+        lastFailureNarration = narration
+
+        let restraintDecision = PaceRestraintGate.decide(
+            buildFailureRestraintContext(forNow: Date())
+        )
+        switch restraintDecision {
+        case .speak:
+            print("⚠️ Failure narration (\(context ?? "no-context")): \(narration.spokenText)")
+            Task { @MainActor in
+                do {
+                    try await ttsClient.speakText(narration.spokenText)
+                } catch {
+                    print("⚠️ Failure narration TTS failed: \(error.localizedDescription)")
+                }
+            }
+        case .stayQuiet(let reason):
+            print("🔇 Suppressed failure narration (\(reason)): \(narration.spokenText)")
+        case .queueUntilIdle(let reason):
+            // First-class queueing isn't wired for failure narration in
+            // v1 — failures should be loud when they happen, and if the
+            // user is mid-input the panel still shows lastFailureNarration.
+            print("⏳ Skipping queued failure narration (\(reason)): \(narration.spokenText)")
+        }
+
+        // Write a paceHistory breadcrumb so "what did you tell me
+        // about earlier?" can recall the failure event later.
+        localRetriever.recordPaceHistory(
+            userTranscript: "(system) failure event",
+            assistantResponse: "Pace surfaced a failure: \(narration.spokenText)"
+        )
+        refreshLocalRetrievalPublishedState()
+    }
+
+    /// Builds the gate context for a failure narration. Failures
+    /// inherit the `watchNudge` semantics — they're proactive speech
+    /// the user didn't directly request, so the gate applies the
+    /// active-call check.
+    private func buildFailureRestraintContext(forNow now: Date) -> PaceRestraintContext {
+        let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        return PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: nil,
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: frontmostBundleIdentifier,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            // Failures are always meaningful intent for the gate's
+            // confidence check; the active-call gate is the real
+            // filter we care about here.
+            intent: .pureKnowledge,
+            proactiveSource: .watchNudge
+        )
+    }
+
+    /// Maps a blocking preflight issue onto a failure narration. Used
+    /// by the agent loop when actions auto-execute (no approval popup)
+    /// and a preflight issue blocks the path silently.
+    func speakFailureForBlockingPreflightIfApplicable(
+        preflightIssues: [PaceToolPreflightIssue]
+    ) {
+        guard let blockingKind = PaceToolPreflight
+            .firstBlockingIssueKind(in: preflightIssues) else {
+            return
+        }
+        switch blockingKind {
+        case .actionsDisabled:
+            // EnableActions=false is an Info.plist condition; the user
+            // already saw the panel banner. Don't speak.
+            return
+        case .accessibilityPermissionMissing:
+            speakPlainLanguageFailure(
+                .missingPermission(permission: .accessibility),
+                context: "preflight"
+            )
+        case .calendarPermissionMissing:
+            speakPlainLanguageFailure(
+                .missingPermission(permission: .calendar),
+                context: "preflight"
+            )
+        case .remindersPermissionMissing:
+            speakPlainLanguageFailure(
+                .missingPermission(permission: .reminders),
+                context: "preflight"
+            )
+        case .mcpServerNotConfigured(let serverName):
+            speakPlainLanguageFailure(
+                .mcpServerNotConfigured(name: serverName),
+                context: "preflight"
+            )
+        }
+    }
+
+    /// Inspects post-execution observations for the all-click-fail
+    /// signal and, if found, speaks the templated click-missed message.
+    /// The observation's `summary` already documents "Click failed:" in
+    /// `clickBestCandidate`, so we match on that prefix.
+    func speakFailureForClickMissedIfApplicable(
+        observations: [PaceActionExecutionObservation],
+        clickTargetLabel: String?
+    ) {
+        let hasClickAllFail = observations.contains { observation in
+            observation.summary.lowercased().contains("click failed")
+        }
+        guard hasClickAllFail else { return }
+        speakPlainLanguageFailure(
+            .clickMissed(targetLabel: clickTargetLabel),
+            context: "click-all-fail"
+        )
+    }
+
+    /// Sidecar-TTS-offline narration. Fired by the agent loop on the
+    /// FIRST turn after the sidecar starts failing, then suppressed
+    /// for `sidecarTTSOfflineCooldown` so the user doesn't hear the
+    /// memo every sentence.
+    func speakSidecarTTSFallbackMemoIfNeeded(
+        isSidecarUnreachable: Bool,
+        now: Date = Date()
+    ) {
+        guard isSidecarUnreachable else {
+            // Sidecar recovered — clear the cooldown so a future
+            // outage will speak again.
+            lastSidecarTTSOfflineNarratedAt = nil
+            return
+        }
+        let sidecarTTSOfflineCooldown: TimeInterval = 30 * 60
+        if let lastNarratedAt = lastSidecarTTSOfflineNarratedAt,
+           now.timeIntervalSince(lastNarratedAt) < sidecarTTSOfflineCooldown {
+            return
+        }
+        lastSidecarTTSOfflineNarratedAt = now
+        speakPlainLanguageFailure(.sidecarTTSOffline, context: "tts-fallback")
+    }
+
     private func routeHUDDetail(for intentPrediction: PaceIntentPrediction) -> String {
         switch intentPrediction.route {
         case .chitchatFastPath:
@@ -704,27 +1641,136 @@ final class CompanionManager: ObservableObject {
         userTranscript: String,
         assistantResponse: String
     ) {
-        conversationHistory.append((
-            userTranscript: userTranscript,
-            assistantResponse: assistantResponse
-        ))
+        let recordedAt = Date()
+        let stableTurnId = "turn-\(Int(recordedAt.timeIntervalSince1970))-\(abs(userTranscript.hashValue))"
 
-        if conversationHistory.count > 1 {
-            conversationHistory.removeFirst(conversationHistory.count - 1)
-        }
+        // Push the turn into the verbatim window. If the window
+        // overflowed, the displaced pair is what feeds the next
+        // detached summarizer call.
+        let displacedTurnPair = threadMemory.record(
+            userTurn: userTranscript,
+            assistantTurn: assistantResponse,
+            turnId: stableTurnId,
+            now: recordedAt
+        )
 
         localRetriever.recordPaceHistory(
             userTranscript: userTranscript,
             assistantResponse: assistantResponse
         )
+        // Mirror the same turn into the in-window chat surface so the
+        // Conversations tab stays aligned with the canonical
+        // `paceHistory` write — voice turns appear in chat history,
+        // and chat turns dedupe against the optimistic user row that
+        // PaceChatSession.submitUserMessage already inserted.
+        chatSession.appendCompletedTurn(
+            userTranscript: userTranscript,
+            assistantResponse: assistantResponse,
+            recordedAt: recordedAt
+        )
         let extractedFacts = episodicFactExtractor.extractFacts(
             from: userTranscript,
             assistantText: assistantResponse,
             frontmostApplicationName: NSWorkspace.shared.frontmostApplication?.localizedName,
-            sourceTurnId: "turn-\(abs(userTranscript.hashValue))"
+            sourceTurnId: stableTurnId
         )
         localRetriever.recordEpisodicFacts(extractedFacts)
         refreshLocalRetrievalPublishedState()
+
+        guard let displacedTurnPair else { return }
+        scheduleDetachedThreadSummarizationCall(
+            displacedTurnPair: displacedTurnPair,
+            recordedAt: recordedAt
+        )
+    }
+
+    /// Mirrors the existing detached episodic-fact-extractor pattern:
+    /// summarization is fire-and-forget on a utility-priority detached
+    /// task. The user-facing planner turn NEVER awaits this. The
+    /// version snapshot captured BEFORE the FM call lets
+    /// `PaceThreadMemory.applySummaryUpdate` drop out-of-order arrivals
+    /// when the user fires multiple turns faster than the summarizer
+    /// completes.
+    private func scheduleDetachedThreadSummarizationCall(
+        displacedTurnPair: PaceThreadTurnPair,
+        recordedAt: Date
+    ) {
+        let priorSummaryForCall = threadMemory.currentSummaryText()
+        let reservedSummaryVersion = threadMemory.reserveNextSummaryVersion()
+        let summarizerInput = PaceThreadSummarizerInput(
+            priorSummary: priorSummaryForCall,
+            displacedTurnPair: displacedTurnPair,
+            sessionStartedAt: recordedAt,
+            frontmostApplicationName: NSWorkspace.shared.frontmostApplication?.localizedName
+        )
+        let summarizerForThisCall = threadSummarizerClient
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                let updatedSummaryText = try await summarizerForThisCall.updatedSummary(
+                    for: summarizerInput
+                )
+                await MainActor.run {
+                    self?.threadMemory.applySummaryUpdate(
+                        summary: updatedSummaryText,
+                        summaryVersion: reservedSummaryVersion,
+                        updatedAt: Date()
+                    )
+                }
+            } catch {
+                // Summarizer failure leaves the prior summary in
+                // place. No retry storm — the next turn will trigger
+                // a fresh call with the next displaced pair.
+                print("⚠️ Thread summarizer call failed: \(error)")
+            }
+        }
+    }
+
+    /// Drops state if the idle threshold elapsed AND journals one
+    /// line into `paceHistory` so "what did we talk about earlier?"
+    /// can recall via the existing keyword retriever. The summary
+    /// text itself is NEVER journaled — only the session id and the
+    /// lifecycle cause.
+    private func evaluateThreadIdleAndResetIfNeeded(now: Date) {
+        guard let sessionEndCause = threadMemory.sessionDidIdle(now: now) else {
+            return
+        }
+        let endingSessionId = threadMemory.currentSessionId
+        threadMemory.resetSession(cause: sessionEndCause, now: now)
+        let causeDisplayName: String
+        switch sessionEndCause {
+        case .idleTimeout:
+            causeDisplayName = "idleTimeout"
+        case .userReset:
+            causeDisplayName = "userReset"
+        }
+        localRetriever.recordPaceHistory(
+            userTranscript: "session ended (cause: \(causeDisplayName))",
+            assistantResponse: "session \(endingSessionId) ended",
+            now: now
+        )
+        refreshLocalRetrievalPublishedState()
+    }
+
+    /// Public surface for the Settings "Reset thread now" button.
+    func resetThreadMemoryNow() {
+        let now = Date()
+        let endingSessionId = threadMemory.currentSessionId
+        threadMemory.resetSession(cause: .userReset, now: now)
+        localRetriever.recordPaceHistory(
+            userTranscript: "session ended (cause: userReset)",
+            assistantResponse: "session \(endingSessionId) ended",
+            now: now
+        )
+        refreshLocalRetrievalPublishedState()
+    }
+
+    /// Settings debug surface: returns the raw summary text + version
+    /// counter so the user can audit what the planner is being told.
+    func currentThreadMemorySummarySnapshot() -> (summaryText: String?, summaryVersion: Int) {
+        return (
+            summaryText: threadMemory.currentSummaryText(),
+            summaryVersion: threadMemory.currentSummaryVersionValue()
+        )
     }
 
     private func appendLocalRetrievalContext(
@@ -1225,6 +2271,66 @@ final class CompanionManager: ObservableObject {
         handleImmediateLocalModeResponse(transcript: transcript, spokenText: spokenText)
     }
 
+    private func handleRecipeCommand(_ command: PaceRecipeCommand, transcript: String) {
+        let flowStore = PaceFlowStore()
+        let bundledRecipes = PaceRecipeLibrary.loadBundledRecipes()
+        let spokenText: String
+
+        switch command {
+        case .install(let displayName):
+            guard let matchedRecipe = matchBundledRecipe(displayName: displayName, in: bundledRecipes) else {
+                spokenText = "i don't have a recipe called \(displayName)."
+                break
+            }
+            do {
+                try PaceRecipeLibrary.install(matchedRecipe, into: flowStore)
+                spokenText = "installed \(matchedRecipe.name)."
+            } catch PaceRecipeInstallError.missingRequiredPreference(let requiredPreferenceKey) {
+                spokenText = "i need \(requiredPreferenceKey) set first."
+            } catch PaceRecipeInstallError.alreadyInstalled {
+                spokenText = "\(matchedRecipe.name) is already installed."
+            } catch {
+                spokenText = "i couldn't install that recipe."
+            }
+        case .uninstall(let displayName):
+            guard let matchedRecipe = matchBundledRecipe(displayName: displayName, in: bundledRecipes) else {
+                spokenText = "i don't have a recipe called \(displayName)."
+                break
+            }
+            if !PaceRecipeLibrary.isInstalled(matchedRecipe, in: flowStore) {
+                spokenText = "\(matchedRecipe.name) isn't installed."
+                break
+            }
+            PaceRecipeLibrary.uninstall(slug: matchedRecipe.slug, from: flowStore)
+            spokenText = "removed \(matchedRecipe.name)."
+        case .list:
+            if bundledRecipes.isEmpty {
+                spokenText = "i don't have any recipes bundled."
+            } else {
+                let displayNames = bundledRecipes.map { $0.name }.joined(separator: ", ")
+                spokenText = "available recipes: \(displayNames)."
+            }
+        }
+
+        handleImmediateLocalModeResponse(transcript: transcript, spokenText: spokenText)
+    }
+
+    /// Case-insensitive lookup of a bundled recipe by display name OR
+    /// slug. Lets the user say "morning standup setup" or
+    /// "morning-standup-setup" and get the same recipe.
+    private func matchBundledRecipe(
+        displayName: String,
+        in bundledRecipes: [PaceBundledRecipe]
+    ) -> PaceBundledRecipe? {
+        let normalizedDisplayName = displayName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return bundledRecipes.first(where: { recipe in
+            recipe.name.lowercased() == normalizedDisplayName
+                || recipe.slug.lowercased() == normalizedDisplayName
+        })
+    }
+
     private func handleImmediateLocalModeResponse(transcript: String, spokenText: String) {
         currentTurnHUDState = .done(spokenText)
         recordConversationTurn(userTranscript: transcript, assistantResponse: spokenText)
@@ -1320,6 +2426,22 @@ final class CompanionManager: ObservableObject {
         globalPushToTalkShortcutMonitor.simulateShortcutPressed()
     }
 
+    /// Entry point for the in-window chat surface. Snapshots the chat
+    /// session's mute flag for THIS turn, then forwards to the same
+    /// pipeline as the `pace://chat` deeplink so chat and voice share
+    /// one planning + execution path. Doing the snapshot here (not
+    /// inside the pipeline) keeps the mute decision tied to the moment
+    /// of submission — toggling mute mid-stream affects the NEXT turn.
+    func submitChatTranscriptFromChatSession(_ transcript: String) {
+        isChatModeMutedForCurrentTurn = chatSession.isChatTTSMuted
+        if isChatModeMutedForCurrentTurn {
+            // Stop any audio that was already in flight from a prior
+            // turn so flipping mute on feels instant.
+            ttsClient.stopPlayback()
+        }
+        submitChatTranscriptFromDeepLink(transcript)
+    }
+
     /// Entry point for the pace://chat deeplink. The transcript is treated
     /// exactly like a spoken turn: same intent classification, fast paths,
     /// retrieval injection, and — critically — the same action-approval
@@ -1329,12 +2451,27 @@ final class CompanionManager: ObservableObject {
             print("🔗 Deeplink chat ignored — turn in flight (\(voiceState))")
             return
         }
+        // The notch chat input lives in the same panel as the turn HUD,
+        // so as soon as a turn is committed the input collapses and
+        // the HUD takes over. Cheap to flip when this code path was
+        // entered from the deeplink (the flag is already false).
+        isNotchChatInputFocused = false
         print("🔗 Deeplink chat transcript: \(transcript)")
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
         ttsClient.stopPlayback()
         streamingSentenceTTSPipeline.resetForNewTurn()
+        // New turn began — hide the reply-replay button so it doesn't
+        // linger past the next push-to-talk press.
+        clearLastSpokenReplyState()
+        // Apply the chat-mode mute snapshot for this turn AFTER reset
+        // (reset clears the pipeline's flag). When the deeplink path
+        // is hit directly the snapshot is false, matching voice-turn
+        // behaviour. Clear the manager-side flag immediately after so
+        // subsequent voice turns can never inherit a stale mute.
+        streamingSentenceTTSPipeline.setMutedForCurrentTurn(isChatModeMutedForCurrentTurn)
+        isChatModeMutedForCurrentTurn = false
         clearDetectedElementLocation()
 
         // Transient cursor mode: surface the overlay for the duration of
@@ -1420,6 +2557,31 @@ final class CompanionManager: ObservableObject {
         // Screen Time indexes at launch — the read either works (Full Disk
         // Access granted) or reports a skipped status; never a prompt.
         refreshScreenTimeRetrievalDocumentsIfAllowed()
+
+        startThreadMemoryIdleSweepTimer()
+
+        // Daily morning brief — opt-in. The scheduler stays inert
+        // (no timer, no fire) until the user enables it in Settings.
+        if isMorningTriageEnabled {
+            morningTriageScheduler.start()
+        }
+    }
+
+    /// 5-minute idle sweep that drops thread-memory state when the
+    /// session has gone quiet. Running this off a timer means the
+    /// menu-bar surface can show "session ended" without waiting for
+    /// the user's next turn to roll the gate.
+    private func startThreadMemoryIdleSweepTimer() {
+        threadMemoryIdleSweepTimer?.invalidate()
+        let lowFrequencySweepIntervalSeconds: TimeInterval = 5 * 60
+        threadMemoryIdleSweepTimer = Timer.scheduledTimer(
+            withTimeInterval: lowFrequencySweepIntervalSeconds,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.evaluateThreadIdleAndResetIfNeeded(now: Date())
+            }
+        }
     }
 
     func clearDetectedElementLocation() {
@@ -1434,6 +2596,7 @@ final class CompanionManager: ObservableObject {
             postureMonitor.stop()
         }
         globalPushToTalkShortcutMonitor.stop()
+        globalChatShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
@@ -1441,6 +2604,7 @@ final class CompanionManager: ObservableObject {
         currentResponseTask?.cancel()
         currentResponseTask = nil
         shortcutTransitionCancellable?.cancel()
+        chatShortcutCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
@@ -1451,6 +2615,9 @@ final class CompanionManager: ObservableObject {
         contactsRetrievalRefreshTask = nil
         fileRetrievalRefreshTask?.cancel()
         fileRetrievalRefreshTask = nil
+        threadMemoryIdleSweepTimer?.invalidate()
+        threadMemoryIdleSweepTimer = nil
+        morningTriageScheduler.stop()
     }
 
     func refreshAllPermissions() {
@@ -1473,8 +2640,10 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
+            globalChatShortcutMonitor.start()
         } else {
             globalPushToTalkShortcutMonitor.stop()
+            globalChatShortcutMonitor.stop()
         }
 
         hasScreenRecordingPermission = permissionService.isGranted(.screenRecording)
@@ -1763,6 +2932,39 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] transition in
                 self?.handleShortcutTransition(transition)
             }
+
+        // Notch chat shortcut (default `cmd+shift+P`). The publisher
+        // fires once per accepted keystroke; we flip the focus flag
+        // and post the existing show-panel notification so the panel
+        // surfaces without the manager needing a direct reference to
+        // `MenuBarPanelManager`.
+        chatShortcutCancellable = globalChatShortcutMonitor
+            .chatShortcutPressed
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleNotchChatShortcutPressed()
+            }
+    }
+
+    /// Brings the panel to front and asks the chat input to focus.
+    /// Routed through both a notification (panel manager listens) and
+    /// the `@Published` flag (CompanionPanelView listens) so neither
+    /// side has to know about the other.
+    private func handleNotchChatShortcutPressed() {
+        // If a turn is already in flight, opening the chat input is
+        // confusing — it can't submit anyway. Drop the shortcut.
+        guard voiceState == .idle else {
+            print("⌨️ Notch chat shortcut ignored — turn in flight (\(voiceState))")
+            return
+        }
+        NotificationCenter.default.post(name: .paceShowPanel, object: nil)
+        isNotchChatInputFocused = true
+    }
+
+    /// Called by the panel's TextField after a successful submit so
+    /// the input collapses back into the existing turn HUD.
+    func dismissNotchChatInputAfterSubmit() {
+        isNotchChatInputFocused = false
     }
 
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
@@ -1792,6 +2994,7 @@ final class CompanionManager: ObservableObject {
             // starts fresh — without this, the diff tracker would think
             // half of the previous reply had already been queued.
             streamingSentenceTTSPipeline.resetForNewTurn()
+            clearLastSpokenReplyState()
             clearDetectedElementLocation()
 
             // Force voice state back to idle BEFORE the dictation observer
@@ -2032,6 +3235,7 @@ final class CompanionManager: ObservableObject {
         currentResponseTask = nil
         ttsClient.stopPlayback()
         streamingSentenceTTSPipeline.resetForNewTurn()
+        clearLastSpokenReplyState()
         responseOverlayManager.finishStreaming()
         currentTurnHUDState = .understanding("using \(option.lowercased())")
         sendTranscriptToPlannerWithScreenshot(transcript: clarifiedTranscript)
@@ -2093,9 +3297,12 @@ final class CompanionManager: ObservableObject {
                     route: .answerDirectly
                 )
 
+                let threadSummaryInjectionForTurn = threadMemory.injectionPrefix()
                 let (fullResponseText, _) = try await plannerForTextOnlyTurn.generateResponseStreaming(
                     images: [],
-                    systemPrompt: CompanionSystemPrompt.buildTextOnly(),
+                    systemPrompt: CompanionSystemPrompt.buildTextOnly(
+                        threadSummaryInjection: threadSummaryInjectionForTurn
+                    ),
                     conversationHistory: historyForPlanner,
                     userPrompt: userPromptForPlanner,
                     onTextChunk: { [weak self] accumulatedPlannerText in
@@ -2188,7 +3395,19 @@ final class CompanionManager: ObservableObject {
                     )
                     if !toolObservations.isEmpty {
                         appendActionResult(.completed(observations: toolObservations))
+                        noteReversibleActionExecuted(
+                            in: fastActionParseResult.executionPlan
+                        )
+                        speakFailureForClickMissedIfApplicable(
+                            observations: toolObservations,
+                            clickTargetLabel: Self.firstClickCandidateLabel(
+                                in: fastActionParseResult.executionPlan
+                            )
+                        )
                     }
+                    speakFailureForBlockingPreflightIfApplicable(
+                        preflightIssues: preflightIssues
+                    )
                     if let userFeedbackText = PaceActionExecutionObservation
                         .formatForUserFeedback(toolObservations) {
                         responseOverlayManager.updateStreamingText(userFeedbackText)
@@ -2287,6 +3506,14 @@ final class CompanionManager: ObservableObject {
         ttsClient.stopPlayback()
         pendingIntentClarification = nil
 
+        // Idle gate: if the thread sat quiet past the configured
+        // threshold, drop the verbatim window + summary and journal
+        // a "session ended" line. The next turn starts a fresh
+        // session. Runs synchronously here AND from a low-frequency
+        // sweep timer so the menu-bar surface drops "session live"
+        // indicators without needing a new turn.
+        evaluateThreadIdleAndResetIfNeeded(now: Date())
+
         // Tell the planner this is a fresh user turn. Stateful conformers
         // (Apple Foundation Models) wipe their cross-call session state
         // here so the next turn doesn't drag in 7 prior agent-loop steps
@@ -2312,6 +3539,12 @@ final class CompanionManager: ObservableObject {
             return
         }
 
+        if let recipeCommand = PaceRecipeCommandParser.parse(transcript) {
+            print("📦 Recipe voice command: \(recipeCommand)")
+            handleRecipeCommand(recipeCommand, transcript: transcript)
+            return
+        }
+
         if let flowCommand = PaceFlowCommandParser.parse(transcript) {
             print("🔁 Flow voice command: \(flowCommand)")
             handleFlowCommand(flowCommand, transcript: transcript)
@@ -2330,7 +3563,44 @@ final class CompanionManager: ObservableObject {
             handleClarificationTurn(transcript: transcript, clarification: clarification)
             return
         }
-        if let unsupportedResponse = PaceIntentUnsupportedDetector.unsupportedResponse(
+        // When the intent is phoneLargeModel and the user has set up the cloud bridge,
+        // route the turn through the bridge instead of refusing it with a local-only message.
+        // This is the one intentional break of the no-cloud-LLM principle — consent-gated.
+        if intentPrediction.route == .phoneLargeModel {
+            let currentBridgeConfiguration = PaceCloudBridgeConsent.loadConfiguration()
+            let bridgeIsActiveForThisTurn = currentBridgeConfiguration.hasUserAcceptedConsent
+                && (currentBridgeConfiguration.mode == .hybrid
+                    || currentBridgeConfiguration.mode == .alwaysBridge)
+
+            if bridgeIsActiveForThisTurn {
+                // Signal HybridPlannerClient (or CloudBridgePlannerClient directly in
+                // alwaysBridge mode) to use the large-model path for this turn.
+                if let hybridPlanner = plannerClient as? HybridPlannerClient {
+                    hybridPlanner.routingHintForNextCall = .preferLarge
+                }
+                // Record first-use so the 24-hour soak timer starts ticking.
+                PaceCloudBridgeConsent.markFirstUsedIfUnset(now: Date())
+                isCloudBridgeCallActive = true
+                isOffDeviceTurnInFlight = true
+
+                let upstreamDisplayName = currentBridgeConfiguration.upstream.displayLabel
+                let bridgeRoutingHUDDetail = "thinking with \(upstreamDisplayName.lowercased())…"
+                currentTurnHUDState = .understanding(bridgeRoutingHUDDetail)
+                print("📡 Routing phoneLargeModel turn to cloud bridge (\(upstreamDisplayName))")
+                // Fall through to the normal planner pipeline — the routing hint
+                // will cause the planner to call the bridge.
+            } else {
+                // Bridge is off or consent not given — keep the existing local-only message.
+                if let unsupportedResponse = PaceIntentUnsupportedDetector.unsupportedResponse(
+                    for: transcript,
+                    prediction: intentPrediction
+                ) {
+                    print("🚫 Unsupported intent: \(unsupportedResponse.reason)")
+                    handleUnsupportedTurn(transcript: transcript, unsupportedResponse: unsupportedResponse)
+                    return
+                }
+            }
+        } else if let unsupportedResponse = PaceIntentUnsupportedDetector.unsupportedResponse(
             for: transcript,
             prediction: intentPrediction
         ) {
@@ -2466,9 +3736,24 @@ final class CompanionManager: ObservableObject {
                     let isAgentModeEnabled = AppBundleConfiguration
                         .stringValue(forKey: "EnableActions")?
                         .lowercased() == "true"
+                    // Mark this turn as off-device for the amber-tint
+                    // capsule when the active planner is anything other
+                    // than the on-device tiers. The Hybrid wrapper sets
+                    // its own bridge-specific flag right before its bridge
+                    // branch fires; this catches every non-Local call
+                    // shape (DirectAPI, alwaysBridge, hybrid-large-routing
+                    // already handled above).
+                    if plannerClient is DirectAPIPlannerClient
+                        || plannerClient is CloudBridgePlannerClient {
+                        isOffDeviceTurnInFlight = true
+                    }
+                    let threadSummaryInjectionForTurn = threadMemory.injectionPrefix()
                     let (fullResponseText, _) = try await plannerClient.generateResponseStreaming(
                         images: imagesForPlanner,
-                        systemPrompt: CompanionSystemPrompt.build(includeAgentMode: isAgentModeEnabled),
+                        systemPrompt: CompanionSystemPrompt.build(
+                            includeAgentMode: isAgentModeEnabled,
+                            threadSummaryInjection: threadSummaryInjectionForTurn
+                        ),
                         conversationHistory: historyForPlanner,
                         userPrompt: userPromptForPlanner,
                         onTextChunk: { [weak self] accumulatedPlannerText in
@@ -2506,6 +3791,14 @@ final class CompanionManager: ObservableObject {
                         }
                     )
                     guard !Task.isCancelled else { return }
+
+                    // Clear the amber bridge indicator now that the stream has finished.
+                    // Do this regardless of whether it was a bridge call or a local call —
+                    // clearing when already false is a safe no-op. The
+                    // unified off-device flag follows the same lifecycle
+                    // so Direct-API turns un-tint the capsule too.
+                    isCloudBridgeCallActive = false
+                    isOffDeviceTurnInFlight = false
 
                     // 6. Parse: action tags → [DONE] flag → pointing tag.
                     //    Each pass strips its own tag class so the final
@@ -2553,6 +3846,21 @@ final class CompanionManager: ObservableObject {
                     responseOverlayManager.updateStreamingText(
                         spokenText.isEmpty ? "…" : spokenText
                     )
+                    // Note the spoken text so the notch panel can show
+                    // the reply-replay button for the next 30 seconds.
+                    // Uses the SAME post-processed string that flows
+                    // through TTS (think blocks + action tags already
+                    // stripped) — see PRD trust-and-failures.
+                    noteLastSpokenReply(spokenText)
+                    // Sidecar TTS health check: if Kokoro has been
+                    // failing this turn, surface the "switched to
+                    // system voice" plain-language failure once per
+                    // outage window.
+                    if let localServerTTSClient = ttsClient as? LocalServerTTSClient {
+                        speakSidecarTTSFallbackMemoIfNeeded(
+                            isSidecarUnreachable: localServerTTSClient.hasObservedSidecarOutage
+                        )
+                    }
 
                     // 7. Move the cursor to the pointing/click target so the
                     //    flight animation is in flight before the click fires.
@@ -2671,6 +3979,19 @@ final class CompanionManager: ObservableObject {
                                     appendActionResult(.completed(observations: toolObservations))
                                     pendingPostActionFeedbackText = PaceActionExecutionObservation
                                         .formatForUserFeedback(toolObservations)
+                                    // After every reversible mutation, raise the
+                                    // visible undo banner (PRD trust-and-failures).
+                                    noteReversibleActionExecuted(
+                                        in: actionParseResult.executionPlan
+                                    )
+                                    // After click-all-fail observations, speak
+                                    // the plain-language failure once.
+                                    speakFailureForClickMissedIfApplicable(
+                                        observations: toolObservations,
+                                        clickTargetLabel: Self.firstClickCandidateLabel(
+                                            in: actionParseResult.executionPlan
+                                        )
+                                    )
                                 }
                             } else {
                                 userDeniedActionApproval = true
@@ -2689,6 +4010,14 @@ final class CompanionManager: ObservableObject {
                             ))
                             print("🤖 \(actionParseResult.actions.count) action(s) parsed but EnableActions is false — exiting loop after this step")
                         }
+
+                        // Narrate any blocking preflight issue regardless of
+                        // approval popup — when the auto-execute path is
+                        // silently blocked (no popup, no actions ran), this
+                        // keeps the failure audible.
+                        speakFailureForBlockingPreflightIfApplicable(
+                            preflightIssues: preflightIssues
+                        )
                     }
 
                     // 11. Exit conditions for the agent loop:
@@ -2746,14 +4075,32 @@ final class CompanionManager: ObservableObject {
                 // User spoke again — response was interrupted. Hide the
                 // overlay immediately so it doesn't linger over the next
                 // turn's "listening…" state.
+                isCloudBridgeCallActive = false
+                isOffDeviceTurnInFlight = false
                 responseOverlayManager.hideOverlay()
             } catch {
                 PaceAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
+                isCloudBridgeCallActive = false
+                isOffDeviceTurnInFlight = false
                 responseOverlayManager.updateStreamingText("error: \(error.localizedDescription)")
                 responseOverlayManager.finishStreaming()
                 currentTurnHUDState = .failed(error.localizedDescription)
                 speakCreditsErrorFallback()
+                // Plain-language failure narration — see PRD
+                // docs/prds/trust-and-failures.md. The cloud bridge
+                // gets its own kind so the user knows which CLI to
+                // inspect; everything else maps onto plannerOffline.
+                if plannerClient is CloudBridgePlannerClient {
+                    speakPlainLanguageFailure(
+                        .cloudBridgeUpstreamError(
+                            provider: cloudBridgeUpstream.displayLabel
+                        ),
+                        context: "planner-catch"
+                    )
+                } else {
+                    speakPlainLanguageFailure(.plannerOffline, context: "planner-catch")
+                }
             }
 
             if !Task.isCancelled {
@@ -3352,4 +4699,22 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+}
+
+/// Weak-back-reference shim that lets `PaceChatSession` forward typed
+/// chat submissions into `CompanionManager.submitChatTranscriptFromChatSession`
+/// without owning the manager. Kept outside the class body so it can
+/// hold the `weak var` without inheriting `@MainActor`-isolation friction
+/// inside `CompanionManager`'s own initializer chain.
+@MainActor
+final class PaceChatSessionSubmitterAdapter: PaceChatTranscriptSubmitting {
+    private weak var owner: CompanionManager?
+
+    init(owner: CompanionManager) {
+        self.owner = owner
+    }
+
+    func submitChatTranscript(_ transcript: String) {
+        owner?.submitChatTranscriptFromChatSession(transcript)
+    }
 }

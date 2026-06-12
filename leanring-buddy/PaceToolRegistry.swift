@@ -72,6 +72,11 @@ struct PaceLocalToolDefinition {
     let riskLevel: PaceToolRiskLevel
     let executionSummary: String
     let observationSummary: String
+    /// Short user-facing voice/chat phrase that would trigger this tool.
+    /// Rendered in the Skills tab of `PaceMainWindow` so the user can
+    /// see at a glance how to ask for each capability. Drift-checked at
+    /// startup — every tool must have a non-empty utterance.
+    let exampleUtterance: String
 
     var promptLine: String {
         "- \(schemaExample) \(description)"
@@ -100,7 +105,8 @@ enum PaceToolRegistry {
             description: "click screenshot pixel coordinates.",
             riskLevel: .inputInjection,
             executionSummary: "Posts a click through Accessibility or CGEvent.",
-            observationSummary: "No observation unless coordinate conversion fails."
+            observationSummary: "No observation unless coordinate conversion fails.",
+            exampleUtterance: "click the Save button"
         ),
         PaceLocalToolDefinition(
             kind: .doubleClick,
@@ -110,7 +116,8 @@ enum PaceToolRegistry {
             description: "double-click screenshot pixel coordinates.",
             riskLevel: .inputInjection,
             executionSummary: "Posts a double-click through CGEvent.",
-            observationSummary: "No observation unless coordinate conversion fails."
+            observationSummary: "No observation unless coordinate conversion fails.",
+            exampleUtterance: "double click that icon"
         ),
         PaceLocalToolDefinition(
             kind: .type,
@@ -120,7 +127,8 @@ enum PaceToolRegistry {
             description: "type exact text into the focused field.",
             riskLevel: .inputInjection,
             executionSummary: "Types literal text into the focused app.",
-            observationSummary: "No observation."
+            observationSummary: "No observation.",
+            exampleUtterance: "type hello world"
         ),
         PaceLocalToolDefinition(
             kind: .setValue,
@@ -130,7 +138,8 @@ enum PaceToolRegistry {
             description: "set focused text or replace selected text through Accessibility. actions: focused, selection.",
             riskLevel: .inputInjection,
             executionSummary: "Uses AXValue to update focused or selected text.",
-            observationSummary: "Reports whether text was updated or no editable target was found."
+            observationSummary: "Reports whether text was updated or no editable target was found.",
+            exampleUtterance: "make this selection more concise"
         ),
         PaceLocalToolDefinition(
             kind: .undo,
@@ -140,7 +149,8 @@ enum PaceToolRegistry {
             description: "undo the last editable text change made by Pace.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Restores the previous AX value from Pace's session mutation log.",
-            observationSummary: "Reports whether an undoable mutation was restored."
+            observationSummary: "Reports whether an undoable mutation was restored.",
+            exampleUtterance: "undo that"
         ),
         PaceLocalToolDefinition(
             kind: .key,
@@ -150,7 +160,8 @@ enum PaceToolRegistry {
             description: "press a key or key chord.",
             riskLevel: .inputInjection,
             executionSummary: "Posts a keyboard event with optional modifiers.",
-            observationSummary: "No observation unless the key is unknown."
+            observationSummary: "No observation unless the key is unknown.",
+            exampleUtterance: "press command S"
         ),
         PaceLocalToolDefinition(
             kind: .clipboard,
@@ -160,7 +171,8 @@ enum PaceToolRegistry {
             description: "read current clipboard text only when explicitly requested.",
             riskLevel: .readOnly,
             executionSummary: "Reads text from NSPasteboard without modifying it.",
-            observationSummary: "Returns a bounded clipboard text preview or empty-text status."
+            observationSummary: "Returns a bounded clipboard text preview or empty-text status.",
+            exampleUtterance: "what's on my clipboard?"
         ),
         PaceLocalToolDefinition(
             kind: .window,
@@ -170,7 +182,8 @@ enum PaceToolRegistry {
             description: "move/resize the focused window. positions: left, right, top, bottom, maximize, center.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Moves and resizes the focused window with Accessibility.",
-            observationSummary: "Reports whether the focused window was snapped."
+            observationSummary: "Reports whether the focused window was snapped.",
+            exampleUtterance: "snap this window to the left half"
         ),
         PaceLocalToolDefinition(
             kind: .scroll,
@@ -180,7 +193,8 @@ enum PaceToolRegistry {
             description: "scroll the focused surface.",
             riskLevel: .inputInjection,
             executionSummary: "Posts a scroll wheel event.",
-            observationSummary: "No observation."
+            observationSummary: "No observation.",
+            exampleUtterance: "scroll down"
         ),
         PaceLocalToolDefinition(
             kind: .openApp,
@@ -190,7 +204,8 @@ enum PaceToolRegistry {
             description: "open a local Mac app by display name.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Launches or activates an app with NSWorkspace.",
-            observationSummary: "No observation unless the app cannot be resolved."
+            observationSummary: "No observation unless the app cannot be resolved.",
+            exampleUtterance: "open Safari"
         ),
         PaceLocalToolDefinition(
             kind: .openURL,
@@ -200,7 +215,8 @@ enum PaceToolRegistry {
             description: "open a website or URL.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Opens a URL with NSWorkspace.",
-            observationSummary: "Reports invalid URLs and opened URLs."
+            observationSummary: "Reports invalid URLs and opened URLs.",
+            exampleUtterance: "open Safari to anthropic.com"
         ),
         PaceLocalToolDefinition(
             kind: .music,
@@ -210,7 +226,8 @@ enum PaceToolRegistry {
             description: "control Music. commands: play, pause, play_pause, next, previous.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Controls Music with AppleScript or media keys.",
-            observationSummary: "Reports Music command completion or AppleScript errors."
+            observationSummary: "Reports Music command completion or AppleScript errors.",
+            exampleUtterance: "play my music"
         ),
         PaceLocalToolDefinition(
             kind: .volume,
@@ -220,7 +237,8 @@ enum PaceToolRegistry {
             description: "adjust system volume.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Posts system volume key events.",
-            observationSummary: "No observation."
+            observationSummary: "No observation.",
+            exampleUtterance: "turn the volume down"
         ),
         PaceLocalToolDefinition(
             kind: .brightness,
@@ -230,7 +248,8 @@ enum PaceToolRegistry {
             description: "adjust display brightness.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Posts display brightness key events.",
-            observationSummary: "No observation."
+            observationSummary: "No observation.",
+            exampleUtterance: "make the screen brighter"
         ),
         PaceLocalToolDefinition(
             kind: .calendar,
@@ -240,7 +259,8 @@ enum PaceToolRegistry {
             description: "read calendar events. ranges: today, tomorrow, week.",
             riskLevel: .readOnly,
             executionSummary: "Reads EventKit calendar events after permission.",
-            observationSummary: "Returns event summaries or permission errors."
+            observationSummary: "Returns event summaries or permission errors.",
+            exampleUtterance: "what's on my calendar this week"
         ),
         PaceLocalToolDefinition(
             kind: .calendarCreate,
@@ -250,7 +270,8 @@ enum PaceToolRegistry {
             description: "create a local calendar event. start is required; date-only values create all-day events.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Creates an EventKit calendar event after permission.",
-            observationSummary: "Reports event creation or permission errors."
+            observationSummary: "Reports event creation or permission errors.",
+            exampleUtterance: "add a design review to my calendar tomorrow at 3pm"
         ),
         PaceLocalToolDefinition(
             kind: .reminder,
@@ -260,7 +281,8 @@ enum PaceToolRegistry {
             description: "create a reminder.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Creates an EventKit reminder after permission.",
-            observationSummary: "Reports reminder creation or permission errors."
+            observationSummary: "Reports reminder creation or permission errors.",
+            exampleUtterance: "remind me to follow up with Alex"
         ),
         PaceLocalToolDefinition(
             kind: .finder,
@@ -270,7 +292,8 @@ enum PaceToolRegistry {
             description: "open or reveal a local file/folder in Finder.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Opens or reveals a local path with NSWorkspace.",
-            observationSummary: "Reports missing paths and opened/revealed paths."
+            observationSummary: "Reports missing paths and opened/revealed paths.",
+            exampleUtterance: "open my Downloads folder"
         ),
         PaceLocalToolDefinition(
             kind: .notes,
@@ -280,7 +303,8 @@ enum PaceToolRegistry {
             description: "create, append, or search Apple Notes. actions: create, append, search.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Creates a note in Apple Notes with AppleScript.",
-            observationSummary: "Reports note creation or AppleScript errors."
+            observationSummary: "Reports note creation or AppleScript errors.",
+            exampleUtterance: "take a note: idea for the launch page"
         ),
         PaceLocalToolDefinition(
             kind: .mail,
@@ -290,7 +314,8 @@ enum PaceToolRegistry {
             description: "compose a Mail draft; never sends automatically.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Creates and opens an Apple Mail draft.",
-            observationSummary: "Reports draft creation or AppleScript errors."
+            observationSummary: "Reports draft creation or AppleScript errors.",
+            exampleUtterance: "draft an email to Alex saying I'll be late"
         ),
         PaceLocalToolDefinition(
             kind: .things,
@@ -300,7 +325,8 @@ enum PaceToolRegistry {
             description: "create a Things to-do if Things is installed.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Creates a Things to-do with AppleScript.",
-            observationSummary: "Reports creation or missing-app/errors."
+            observationSummary: "Reports creation or missing-app/errors.",
+            exampleUtterance: "add buy milk to my Things inbox"
         ),
         PaceLocalToolDefinition(
             kind: .shortcuts,
@@ -310,7 +336,8 @@ enum PaceToolRegistry {
             description: "run a named macOS Shortcut.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Runs a named shortcut through the Shortcuts app.",
-            observationSummary: "Reports shortcut execution or AppleScript errors."
+            observationSummary: "Reports shortcut execution or AppleScript errors.",
+            exampleUtterance: "run my Morning Routine shortcut"
         ),
         PaceLocalToolDefinition(
             kind: .messages,
@@ -320,7 +347,8 @@ enum PaceToolRegistry {
             description: "open Messages and prepare a conversation; sending must be explicit.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Opens Messages or prepares a message draft.",
-            observationSummary: "Reports whether Messages was opened."
+            observationSummary: "Reports whether Messages was opened.",
+            exampleUtterance: "open Messages with Alex"
         ),
         PaceLocalToolDefinition(
             kind: .downloadFile,
@@ -330,7 +358,8 @@ enum PaceToolRegistry {
             description: "download a user-named http(s) URL into ~/Downloads. The product's only network action; always user-commanded.",
             riskLevel: .externalIntegration,
             executionSummary: "Downloads the URL into ~/Downloads with a sanitized, collision-free filename.",
-            observationSummary: "Reports the saved filename and byte count, or the failure reason."
+            observationSummary: "Reports the saved filename and byte count, or the failure reason.",
+            exampleUtterance: "download the report at example.com/report.pdf"
         ),
         PaceLocalToolDefinition(
             kind: .startTimer,
@@ -340,7 +369,8 @@ enum PaceToolRegistry {
             description: "schedule a spoken nudge after a duration. duration accepts \"3 minutes\", \"30s\", \"2 hours\", or a plain seconds number.",
             riskLevel: .appOrSystemMutation,
             executionSummary: "Schedules an in-process Timer that fires a spoken nudge through TTS.",
-            observationSummary: "Reports the scheduled fire time, or a validation error if the duration was unparseable."
+            observationSummary: "Reports the scheduled fire time, or a validation error if the duration was unparseable.",
+            exampleUtterance: "set a 5 minute timer for tea"
         ),
         PaceLocalToolDefinition(
             kind: .recordFlow,
@@ -350,7 +380,8 @@ enum PaceToolRegistry {
             description: "start recording a user-demonstrated local flow by name. Recording stores AX/key steps, not pixels.",
             riskLevel: .inputInjection,
             executionSummary: "Starts or stops a local demonstration-recording session.",
-            observationSummary: "Reports recording state or missing flow name."
+            observationSummary: "Reports recording state or missing flow name.",
+            exampleUtterance: "record this as my standup setup"
         ),
         PaceLocalToolDefinition(
             kind: .runFlow,
@@ -360,7 +391,8 @@ enum PaceToolRegistry {
             description: "run a previously recorded local flow by name. User approval is required before replay.",
             riskLevel: .inputInjection,
             executionSummary: "Replays saved AX/key steps through the local executor.",
-            observationSummary: "Reports replay start or missing flow."
+            observationSummary: "Reports replay start or missing flow.",
+            exampleUtterance: "run my standup setup flow"
         )
     ]
 
@@ -391,8 +423,15 @@ enum PaceToolRegistry {
                 bundle: .main,
                 allowSourceTreeFallback: false
             )
-        guard validationIssues.isEmpty else {
-            let formattedIssues = validationIssues
+        // Recipe library validation runs alongside the tool registry
+        // validation so malformed recipe JSON fails the app at launch
+        // — same fail-fast contract the registry uses.
+        let recipeValidationIssues = PaceRecipeLibrary
+            .validateBundledRecipes(bundle: .main, allowSourceTreeFallback: false)
+            .map { PaceToolRegistryValidationIssue(message: "bundled recipe: \($0.message)") }
+        let allValidationIssues = validationIssues + recipeValidationIssues
+        guard allValidationIssues.isEmpty else {
+            let formattedIssues = allValidationIssues
                 .map { "- \($0.description)" }
                 .joined(separator: "\n")
             fatalError("Pace local tool registry is invalid:\n\(formattedIssues)")
@@ -451,6 +490,9 @@ enum PaceToolRegistry {
             }
             if definition.observationSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 validationIssues.append(.init(message: "\(definition.canonicalName) has an empty observation summary"))
+            }
+            if definition.exampleUtterance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                validationIssues.append(.init(message: "\(definition.canonicalName) has an empty example utterance"))
             }
 
             for toolName in definition.allNames {
@@ -786,6 +828,13 @@ enum PaceToolRegistry {
         let artifactExampleToolName = schemaExample["tool"] as? String
         if normalizeToolName(artifactExampleToolName ?? "") != normalizeToolName(definition.canonicalName) {
             validationIssues.append(.init(message: "v10 artifact schemaExample tool drift for \(definition.canonicalName)"))
+        }
+
+        let artifactExampleUtterance = (actionObject["exampleUtterance"] as? String) ?? ""
+        if artifactExampleUtterance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            validationIssues.append(.init(message: "v10 artifact exampleUtterance missing for \(definition.canonicalName)"))
+        } else if artifactExampleUtterance != definition.exampleUtterance {
+            validationIssues.append(.init(message: "v10 artifact exampleUtterance drift for \(definition.canonicalName)"))
         }
 
         return validationIssues

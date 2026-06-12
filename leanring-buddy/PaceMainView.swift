@@ -11,7 +11,9 @@ import SwiftUI
 
 enum PaceMainSection: String, CaseIterable, Identifiable {
     case conversations = "Conversations"
+    case skills = "Skills"
     case usage = "Usage"
+    case privacy = "Privacy"
     case permissions = "Permissions"
     case about = "About"
 
@@ -20,7 +22,9 @@ enum PaceMainSection: String, CaseIterable, Identifiable {
     var iconSystemName: String {
         switch self {
         case .conversations: return "bubble.left.and.bubble.right"
+        case .skills: return "square.grid.2x2"
         case .usage: return "chart.bar"
+        case .privacy: return "hand.raised"
         case .permissions: return "lock.shield"
         case .about: return "info.circle"
         }
@@ -42,9 +46,13 @@ struct PaceMainView: View {
         } detail: {
             switch selectedSection ?? .conversations {
             case .conversations:
-                PaceConversationsView()
+                PaceConversationsView(companionManager: companionManager)
+            case .skills:
+                PaceSkillsView()
             case .usage:
                 PaceUsageAnalyticsView()
+            case .privacy:
+                PacePrivacyDashboardView(companionManager: companionManager)
             case .permissions:
                 PacePermissionsView(companionManager: companionManager)
             case .about:

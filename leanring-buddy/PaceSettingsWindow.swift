@@ -46,9 +46,12 @@ final class PaceSettingsWindowManager {
 
 private enum PaceSettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
+    case planner = "Planner"
     case mcp = "MCP"
     case permissions = "Permissions"
     case voice = "Voice"
+    case cloudBridge = "Cloud bridge"
+    case flows = "Flows"
     case activity = "Activity"
 
     var id: String { rawValue }
@@ -57,12 +60,18 @@ private enum PaceSettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general:
             return "switch.2"
+        case .planner:
+            return "brain.head.profile"
         case .mcp:
             return "point.3.connected.trianglepath.dotted"
         case .permissions:
             return "lock.shield"
         case .voice:
             return "waveform"
+        case .cloudBridge:
+            return "antenna.radiowaves.left.and.right"
+        case .flows:
+            return "play.square.stack"
         case .activity:
             return "list.bullet.rectangle"
         }
@@ -73,6 +82,64 @@ struct PaceSettingsWindowView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var selectedTab: PaceSettingsTab = .general
     @State private var configuredMCPServerNames: [String] = PaceMCPServerRegistry.loadConfiguredServers().keys.sorted()
+    /// Last per-catalog-slug operation feedback so the install card can
+    /// show "Installed ✓" / "Removed" / "Failed: …" after each tap.
+    /// Resets to nil on a fresh refresh so stale outcomes don't linger.
+    @State private var lastCatalogActionBySlug: [String: String] = [:]
+    /// Reachability result from `GET /health` on the bridge endpoint.
+    /// nil = not yet checked, true = reachable, false = unreachable.
+    @State private var cloudBridgeIsReachable: Bool? = nil
+    @State private var cloudBridgeReachabilityLastCheckedAt: Date? = nil
+
+    // MARK: - Direct API tier state
+
+    /// Buffered API-key text field input. Cleared after Save so the key
+    /// is never held in SwiftUI state longer than necessary.
+    @State private var directAPIKeyEntryFieldText: String = ""
+    /// Outcome of the last "Test" round trip. nil = not yet tested.
+    @State private var lastDirectAPITestOutcomeText: String? = nil
+    @State private var lastDirectAPITestWasSuccessful: Bool = false
+    @State private var isDirectAPITestInFlight: Bool = false
+    /// Snapshot of which providers currently have a key stored in
+    /// Keychain. Refreshed on view appear and after every save/delete.
+    @State private var providersWithStoredDirectAPIKeys: Set<PaceDirectAPIProvider> = []
+
+    // MARK: - Thread memory state
+    //
+    // These mirror `PaceUserPreferencesStore` values so the picker /
+    // toggles can update immediately. The `setX` calls write through
+    // to UserDefaults; the new value takes effect on the next
+    // `CompanionManager.start()` (which is fine for an end-of-PRD-V1
+    // surface — the picker is a setup-time control, not a per-turn
+    // control).
+
+    @State private var isThreadMemoryEnabledForSettings: Bool = PaceUserPreferencesStore
+        .bool(.isThreadMemoryEnabled, default: true)
+    @State private var threadMemoryVerbatimWindowSizeForSettings: Int = PaceUserPreferencesStore
+        .clampedInt(.threadMemoryVerbatimWindowSize, default: 4, in: 1...8)
+    @State private var threadMemoryIdleMinutesForSettings: Int = PaceUserPreferencesStore
+        .clampedInt(.threadMemoryIdleMinutes, default: 20, in: 5...60)
+    @State private var isThreadMemoryDebugViewEnabledForSettings: Bool = PaceUserPreferencesStore
+        .bool(.isThreadMemoryDebugViewEnabled, default: false)
+    @State private var isThreadEndingEpisodicHandoffEnabledForSettings: Bool = PaceUserPreferencesStore
+        .bool(.isThreadEndingEpisodicHandoffEnabled, default: false)
+    /// Tick value used to force a redraw of the debug summary text
+    /// when the user clicks "Reset thread now". The summary itself is
+    /// pulled from `companionManager.currentThreadMemorySummarySnapshot()`
+    /// on each render.
+    @State private var threadMemoryRefreshTick: Int = 0
+
+    // MARK: - Recipe library state
+    //
+    // The bundled recipes are loaded once on view appear; the
+    // installed-set is recomputed from `PaceFlowStore` whenever the
+    // refresh tick changes (after install/uninstall) so the row
+    // buttons can flip between "Install" and "Installed · Uninstall".
+
+    @State private var bundledRecipesForSettings: [PaceBundledRecipe] = []
+    @State private var installedRecipeSlugsForSettings: Set<String> = []
+    @State private var recipeLibraryRefreshTick: Int = 0
+    @State private var lastRecipeActionMessage: String? = nil
 
     var body: some View {
         HStack(spacing: 0) {
@@ -137,12 +204,18 @@ struct PaceSettingsWindowView: View {
                 switch selectedTab {
                 case .general:
                     generalContent
+                case .planner:
+                    plannerContent
                 case .mcp:
                     mcpContent
                 case .permissions:
                     permissionsContent
                 case .voice:
                     voiceContent
+                case .cloudBridge:
+                    cloudBridgeContent
+                case .flows:
+                    flowsContent
                 case .activity:
                     activityContent
                 }
@@ -247,65 +320,634 @@ struct PaceSettingsWindowView: View {
                 }
                 .padding(.top, 6)
             }
+
+            morningBriefSubsection
+                .padding(.top, 18)
+        }
+    }
+
+    // MARK: - Morning brief subsection
+
+    /// Settings → General → Morning brief. Toggle + hour/minute pickers
+    /// + a "Send it now" preview button. The toggle is opt-in (default
+    /// OFF in `PaceUserPreferencesStore`); the preview button always
+    /// works so users can tune brief content before committing to a
+    /// daily fire time.
+    private var morningBriefSubsection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Morning brief")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+                .padding(.bottom, 6)
+
+            settingsToggleRow(
+                title: "Daily morning brief",
+                subtitle: "Calm 30-second spoken brief at the configured weekday time. Gated by the same active-call rules as other proactive features.",
+                isOn: Binding(
+                    get: { companionManager.isMorningTriageEnabled },
+                    set: { companionManager.setMorningTriageEnabled($0) }
+                )
+            )
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Fire time")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Text("Local time, weekdays only. Saturday and Sunday are skipped.")
+                        .font(.system(size: 12))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                Spacer()
+                Picker(
+                    "Hour",
+                    selection: Binding(
+                        get: { companionManager.morningTriageHourOfDay },
+                        set: { companionManager.setMorningTriageHourOfDay($0) }
+                    )
+                ) {
+                    ForEach(0..<24, id: \.self) { hourOfDayCandidate in
+                        Text(String(format: "%02d", hourOfDayCandidate))
+                            .tag(hourOfDayCandidate)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 60)
+
+                Text(":")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Picker(
+                    "Minute",
+                    selection: Binding(
+                        get: { companionManager.morningTriageMinuteOfHour },
+                        set: { companionManager.setMorningTriageMinuteOfHour($0) }
+                    )
+                ) {
+                    ForEach(0..<60, id: \.self) { minuteOfHourCandidate in
+                        Text(String(format: "%02d", minuteOfHourCandidate))
+                            .tag(minuteOfHourCandidate)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 60)
+            }
+            .padding(.vertical, 12)
+            .overlay(alignment: .bottom) {
+                Divider()
+                    .background(DS.Colors.borderSubtle)
+            }
+
+            HStack {
+                Spacer()
+                settingsButton("Send it now", systemName: "paperplane") {
+                    companionManager.deliverMorningBriefPreviewNow()
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+
+    // MARK: - Planner tab
+
+    /// Settings → Planner: the single user-facing tier picker (Local /
+    /// CLI bridge / Direct API / Apple FM) plus the Direct-API
+    /// configuration sub-panel. See planner-tier-picker.md.
+    private var plannerContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            plannerTierPickerSection
+            Divider().background(DS.Colors.borderSubtle)
+            plannerActiveTierConfigurationSection
+        }
+        .onAppear {
+            refreshProvidersWithStoredDirectAPIKeys()
+        }
+    }
+
+    private var plannerTierPickerSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Backend tier")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            VStack(spacing: 0) {
+                ForEach(PacePlannerTier.allCases, id: \.rawValue) { plannerTier in
+                    plannerTierRow(plannerTier)
+                }
+            }
+        }
+    }
+
+    private func plannerTierRow(_ plannerTier: PacePlannerTier) -> some View {
+        let (tierTitle, tierSubtitle) = plannerTierLabels(for: plannerTier)
+        let isSelected = companionManager.activePlannerTier == plannerTier
+        return HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(tierTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                Text(tierSubtitle)
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(DS.Colors.accent)
+            }
+        }
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard companionManager.activePlannerTier != plannerTier else { return }
+            handlePlannerTierTap(plannerTier)
+        }
+        .overlay(alignment: .bottom) {
+            Divider().background(DS.Colors.borderSubtle)
+        }
+    }
+
+    private func plannerTierLabels(for plannerTier: PacePlannerTier) -> (title: String, subtitle: String) {
+        switch plannerTier {
+        case .local:
+            return (
+                "Local — LM Studio",
+                "On-device reasoner (gemma-3-12b by default). Free. Nothing leaves your Mac."
+            )
+        case .cliBridge:
+            return (
+                "CLI bridge",
+                "Routes turns through your already-authenticated Claude Code / Codex / Gemini CLI via localhost:3456. Free if you already pay for the CLI."
+            )
+        case .directAPI:
+            return (
+                "Direct API (BYO key)",
+                "Pace calls Anthropic / OpenAI / OpenRouter directly using a key you paste below. Stored in macOS Keychain only — never in Pace preferences."
+            )
+        case .appleFoundationModels:
+            return (
+                "Apple Foundation Models only",
+                "Apple's on-device 3B model as the sole planner. Requires Apple Intelligence enabled."
+            )
+        }
+    }
+
+    private func handlePlannerTierTap(_ newPlannerTier: PacePlannerTier) {
+        switch newPlannerTier {
+        case .local, .appleFoundationModels:
+            companionManager.setActivePlannerTier(newPlannerTier)
+        case .cliBridge:
+            // First-time enablement still goes through the existing
+            // NSAlert consent dialog. Rejection reverts to local.
+            let consentAccepted = companionManager.requestCloudBridgeConsentIfNeeded()
+            guard consentAccepted else {
+                companionManager.setActivePlannerTier(.local)
+                return
+            }
+            // If the saved bridge mode is .off (default after first
+            // consent), promote it to hybrid so the user immediately
+            // benefits from the tier they just picked.
+            if companionManager.cloudBridgeMode == .off {
+                companionManager.setCloudBridgeMode(.hybrid)
+            }
+            companionManager.setActivePlannerTier(newPlannerTier)
+        case .directAPI:
+            // No NSAlert here — the explicit pick is the consent. The
+            // sub-panel below requires Save Key + (optionally) Test
+            // before turns actually route to the provider.
+            companionManager.setActivePlannerTier(newPlannerTier)
+        }
+    }
+
+    @ViewBuilder
+    private var plannerActiveTierConfigurationSection: some View {
+        switch companionManager.activePlannerTier {
+        case .local:
+            plannerLocalDetailPanel
+        case .cliBridge:
+            plannerCLIBridgeDetailPanel
+        case .directAPI:
+            plannerDirectAPIDetailPanel
+        case .appleFoundationModels:
+            plannerAppleFoundationModelsDetailPanel
+        }
+    }
+
+    private var plannerLocalDetailPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("LM Studio")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(companionManager.isLMStudioReachable ? DS.Colors.success : DS.Colors.warning)
+                    .frame(width: 8, height: 8)
+                Text(companionManager.isLMStudioReachable ? "Reachable" : "Not reachable — open LM Studio and load the configured model.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+            }
+            Text("Default model: google/gemma-3-12b. Configure model name via Info.plist key LocalPlannerModelIdentifier.")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+        }
+    }
+
+    private var plannerCLIBridgeDetailPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("CLI bridge")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+            Text("Configure the upstream CLI, model, and consent in the Cloud bridge tab. This tier reuses that configuration.")
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textTertiary)
+            Text("Active mode: \(companionManager.cloudBridgeMode.rawValue)  •  Upstream: \(companionManager.cloudBridgeUpstream.displayLabel)  •  Model: \(companionManager.cloudBridgeModel)")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(DS.Colors.textTertiary)
+        }
+    }
+
+    private var plannerAppleFoundationModelsDetailPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Apple Foundation Models")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+            Text("Free, on-device. Requires Apple Intelligence to be enabled in System Settings. Best for short voice answers and routine tool calls. For harder action plans, upgrade to Local — LM Studio.")
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            settingsButton("Open Apple Intelligence settings", systemName: "apple.logo") {
+                if let appleIntelligenceURL = URL(string: "x-apple.systempreferences:com.apple.AppleIntelligence-Settings.extension") {
+                    NSWorkspace.shared.open(appleIntelligenceURL)
+                }
+            }
+            if companionManager.isLMStudioReachable {
+                // LM Studio is already running on the user's machine —
+                // surface the upgrade affordance prominently. This is the
+                // one-click hop from "first-run default" to "best quality"
+                // promised by docs/prds/first-run-experience.md.
+                Divider().background(DS.Colors.borderSubtle).padding(.vertical, 4)
+                Text("LM Studio is running locally — upgrade for better quality on hard action plans.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                settingsButton("Upgrade to Local — LM Studio", systemName: "arrow.up.circle") {
+                    companionManager.setActivePlannerTier(.local)
+                }
+            }
+        }
+    }
+
+    private var plannerDirectAPIDetailPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Provider picker
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Provider")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Picker("", selection: Binding(
+                    get: { companionManager.directAPIProvider },
+                    set: { newProvider in
+                        companionManager.setDirectAPIProvider(newProvider)
+                        // Clear the test outcome — provider switch invalidates it.
+                        lastDirectAPITestOutcomeText = nil
+                    }
+                )) {
+                    ForEach(PaceDirectAPIProvider.allCases, id: \.rawValue) { directAPIProvider in
+                        let storedKeyIndicator = providersWithStoredDirectAPIKeys.contains(directAPIProvider) ? " ✓" : ""
+                        Text(directAPIProvider.displayLabel + storedKeyIndicator).tag(directAPIProvider)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+
+            // API key field + Save/Delete buttons
+            VStack(alignment: .leading, spacing: 6) {
+                Text("API key")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                SecureField("Paste your \(companionManager.directAPIProvider.displayLabel) API key", text: $directAPIKeyEntryFieldText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                HStack(spacing: 10) {
+                    let entryFieldTextTrimmed = directAPIKeyEntryFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    settingsButton("Save key", systemName: "key.fill") {
+                        guard !entryFieldTextTrimmed.isEmpty else { return }
+                        let didStore = companionManager.saveDirectAPIKey(
+                            entryFieldTextTrimmed,
+                            for: companionManager.directAPIProvider
+                        )
+                        if didStore {
+                            directAPIKeyEntryFieldText = ""
+                            refreshProvidersWithStoredDirectAPIKeys()
+                            lastDirectAPITestOutcomeText = nil
+                        }
+                    }
+                    .disabled(entryFieldTextTrimmed.isEmpty)
+                    .opacity(entryFieldTextTrimmed.isEmpty ? 0.45 : 1)
+
+                    settingsButton("Delete key", systemName: "trash") {
+                        _ = companionManager.deleteDirectAPIKey(for: companionManager.directAPIProvider)
+                        refreshProvidersWithStoredDirectAPIKeys()
+                        lastDirectAPITestOutcomeText = nil
+                    }
+                    .disabled(!providersWithStoredDirectAPIKeys.contains(companionManager.directAPIProvider))
+                    .opacity(providersWithStoredDirectAPIKeys.contains(companionManager.directAPIProvider) ? 1 : 0.45)
+                }
+                Text("Keys are stored in macOS Keychain (service com.pace.app.plannerAPIKeys). They never sync via iCloud and never touch UserDefaults, Info.plist, or any log.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Model identifier text field
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Model")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                TextField(
+                    companionManager.directAPIProvider.defaultModelIdentifier,
+                    text: Binding(
+                        get: { companionManager.directAPIModelIdentifier },
+                        set: { companionManager.setDirectAPIModelIdentifier($0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+            }
+
+            // Custom endpoint URL (only when provider == .custom)
+            if companionManager.directAPIProvider == .custom {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Endpoint URL")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    TextField(
+                        "https://example.com/v1/chat/completions",
+                        text: Binding(
+                            get: { companionManager.directAPICustomEndpointURLString },
+                            set: { companionManager.setDirectAPICustomEndpointURLString($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    Text("Must be https. http is only accepted for loopback hosts (local OpenAI-compatible proxies).")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+
+            // Fall-back-on-failure toggle (default OFF per PRD)
+            settingsToggleRow(
+                title: "Fall back to local on cloud failure",
+                subtitle: "Off by default. When on, Pace silently retries failed Direct-API turns against LM Studio. When off, errors surface verbatim so you know what happened.",
+                isOn: Binding(
+                    get: { companionManager.directAPIFallsBackToLocalOnCloudFailure },
+                    set: { companionManager.setDirectAPIFallsBackToLocalOnCloudFailure($0) }
+                )
+            )
+
+            // Test round-trip button + last outcome row
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    settingsButton(isDirectAPITestInFlight ? "Testing…" : "Test", systemName: "bolt.fill") {
+                        runDirectAPITest()
+                    }
+                    .disabled(
+                        isDirectAPITestInFlight
+                        || !providersWithStoredDirectAPIKeys.contains(companionManager.directAPIProvider)
+                    )
+                    .opacity(
+                        (isDirectAPITestInFlight
+                         || !providersWithStoredDirectAPIKeys.contains(companionManager.directAPIProvider))
+                        ? 0.45 : 1
+                    )
+
+                    if let lastOutcomeText = lastDirectAPITestOutcomeText {
+                        HStack(spacing: 6) {
+                            Image(systemName: lastDirectAPITestWasSuccessful ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                .foregroundColor(lastDirectAPITestWasSuccessful ? DS.Colors.success : DS.Colors.warning)
+                            Text(lastOutcomeText)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(DS.Colors.textPrimary)
+                                .lineLimit(2)
+                                .truncationMode(.tail)
+                        }
+                    }
+                    Spacer()
+                }
+                if !providersWithStoredDirectAPIKeys.contains(companionManager.directAPIProvider) {
+                    Text("Save an API key for \(companionManager.directAPIProvider.displayLabel) to enable the round-trip test.")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.warning)
+                }
+            }
+        }
+    }
+
+    private func refreshProvidersWithStoredDirectAPIKeys() {
+        providersWithStoredDirectAPIKeys = companionManager.providersWithStoredDirectAPIKeys()
+    }
+
+    private func runDirectAPITest() {
+        isDirectAPITestInFlight = true
+        lastDirectAPITestOutcomeText = nil
+        Task { @MainActor in
+            let testOutcome = await companionManager.runDirectAPITestRoundTrip()
+            switch testOutcome {
+            case .success(let echoedModelResponse):
+                lastDirectAPITestWasSuccessful = true
+                lastDirectAPITestOutcomeText = echoedModelResponse.isEmpty
+                    ? "OK (empty response)"
+                    : echoedModelResponse
+            case .failure(let testError):
+                lastDirectAPITestWasSuccessful = false
+                lastDirectAPITestOutcomeText = testError.localizedDescription
+            }
+            isDirectAPITestInFlight = false
         }
     }
 
     private var mcpContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Config file")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(DS.Colors.textSecondary)
-                Text(PaceMCPServerRegistry.configurationPaths[0].path)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .textSelection(.enabled)
-            }
-
-            HStack(spacing: 10) {
-                settingsButton("Create / Open", systemName: "doc.badge.gearshape") {
-                    createMCPConfigIfNeeded()
-                    openPrimaryMCPConfig()
-                    refreshMCPServerNames()
-                }
-                settingsButton("Reveal", systemName: "folder") {
-                    createMCPConfigIfNeeded()
-                    NSWorkspace.shared.activateFileViewerSelecting([PaceMCPServerRegistry.configurationPaths[0]])
-                    refreshMCPServerNames()
-                }
-                settingsButton("Refresh", systemName: "arrow.clockwise") {
-                    refreshMCPServerNames()
-                }
-            }
-
-            Divider()
-                .background(DS.Colors.borderSubtle)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Configured servers")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(DS.Colors.textSecondary)
-
-                if configuredMCPServerNames.isEmpty {
-                    Text("No MCP servers configured yet. Create / Open seeds apple-mcp (Contacts, Notes, Messages, Mail, Reminders, Calendar, Maps); add any other MCP server by editing the same config file.")
-                        .font(.system(size: 12))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Config file")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text(PaceMCPServerRegistry.configurationPaths[0].path)
+                        .font(.system(size: 12, design: .monospaced))
                         .foregroundColor(DS.Colors.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    ForEach(configuredMCPServerNames, id: \.self) { serverName in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(DS.Colors.success)
-                                .frame(width: 7, height: 7)
-                            Text(serverName)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundColor(DS.Colors.textPrimary)
-                            Spacer()
+                        .textSelection(.enabled)
+                }
+
+                HStack(spacing: 10) {
+                    settingsButton("Create / Open", systemName: "doc.badge.gearshape") {
+                        createMCPConfigIfNeeded()
+                        openPrimaryMCPConfig()
+                        refreshMCPServerNames()
+                    }
+                    settingsButton("Reveal", systemName: "folder") {
+                        createMCPConfigIfNeeded()
+                        NSWorkspace.shared.activateFileViewerSelecting([PaceMCPServerRegistry.configurationPaths[0]])
+                        refreshMCPServerNames()
+                    }
+                    settingsButton("Refresh", systemName: "arrow.clockwise") {
+                        refreshMCPServerNames()
+                    }
+                }
+
+                Divider()
+                    .background(DS.Colors.borderSubtle)
+
+                mcpCatalogSection
+
+                Divider()
+                    .background(DS.Colors.borderSubtle)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Configured servers")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+
+                    if configuredMCPServerNames.isEmpty {
+                        Text("No MCP servers configured yet. Install one from the catalog above, or use Create / Open to seed the file.")
+                            .font(.system(size: 12))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(configuredMCPServerNames, id: \.self) { serverName in
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(DS.Colors.success)
+                                    .frame(width: 7, height: 7)
+                                Text(serverName)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(DS.Colors.textPrimary)
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
                     }
                 }
             }
+        }
+    }
+
+    /// Curated MCP server catalog rendered as one-tap install cards.
+    /// Each card writes/removes a single server entry in
+    /// `mcp-servers.json` via `PaceMCPCatalogInstaller`, which performs
+    /// an atomic JSON merge that preserves every other server the user
+    /// has already configured by hand.
+    private var mcpCatalogSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Install a popular server")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+            Text("One-tap installs for the six MCP servers users ask about most. Adds the entry to your local config — never fetches a remote catalog.")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 6) {
+                ForEach(PaceMCPServerCatalog.bundledCatalog) { catalogEntry in
+                    mcpCatalogCardRow(entry: catalogEntry)
+                }
+            }
+        }
+    }
+
+    private func mcpCatalogCardRow(entry: PaceMCPServerCatalogEntry) -> some View {
+        let isInstalled = configuredMCPServerNames.contains(entry.slug)
+        let statusFeedback = lastCatalogActionBySlug[entry.slug]
+        return HStack(alignment: .top, spacing: 10) {
+            Circle()
+                .fill(isInstalled ? DS.Colors.success : Color.gray.opacity(0.4))
+                .frame(width: 8, height: 8)
+                .padding(.top, 6)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(entry.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    if isInstalled {
+                        Text("Installed")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Colors.success)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule().fill(DS.Colors.success.opacity(0.12))
+                            )
+                    }
+                }
+                Text(entry.description)
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let setupNote = entry.setupNote {
+                    Text(setupNote)
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let statusFeedback {
+                    Text(statusFeedback)
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            VStack(alignment: .trailing, spacing: 6) {
+                if isInstalled {
+                    settingsButton("Remove", systemName: "trash") {
+                        uninstallCatalogEntry(entry)
+                    }
+                } else {
+                    settingsButton("Install", systemName: "arrow.down.circle") {
+                        installCatalogEntry(entry)
+                    }
+                }
+                if let docsURL = entry.setupDocsURL {
+                    settingsButton("Setup docs", systemName: "book") {
+                        NSWorkspace.shared.open(docsURL)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+    }
+
+    private func installCatalogEntry(_ entry: PaceMCPServerCatalogEntry) {
+        let configURL = PaceMCPServerRegistry.configurationPaths[0]
+        do {
+            try PaceMCPCatalogInstaller.install(entry, into: configURL)
+            lastCatalogActionBySlug[entry.slug] = "Installed. Edit \(configURL.lastPathComponent) to fill in any required values."
+            refreshMCPServerNames()
+        } catch {
+            lastCatalogActionBySlug[entry.slug] = "Install failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func uninstallCatalogEntry(_ entry: PaceMCPServerCatalogEntry) {
+        let configURL = PaceMCPServerRegistry.configurationPaths[0]
+        do {
+            try PaceMCPCatalogInstaller.uninstall(slug: entry.slug, from: configURL)
+            lastCatalogActionBySlug[entry.slug] = "Removed from \(configURL.lastPathComponent)."
+            refreshMCPServerNames()
+        } catch {
+            lastCatalogActionBySlug[entry.slug] = "Remove failed: \(error.localizedDescription)"
         }
     }
 
@@ -389,8 +1031,495 @@ struct PaceSettingsWindowView: View {
         }
     }
 
+    private var cloudBridgeContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Explanation banner
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Opt-in only. Default is Off.")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("The cloud bridge routes turns through the local-ai Node server at localhost:3456, which spawns your already-authenticated CLI tool and contacts its cloud provider. This is the only intentional break of Pace's on-device-only principle. First enablement shows a consent dialog.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().background(DS.Colors.borderSubtle)
+
+            // Mode picker
+            VStack(spacing: 0) {
+                let canEnableAlwaysBridge = PaceCloudBridgeConsent.canEnableAlwaysBridge(now: Date())
+
+                ForEach(PaceCloudBridgeMode.allCases, id: \.rawValue) { mode in
+                    let modeDisplayName: String = {
+                        switch mode {
+                        case .off:          return "Off (local only)"
+                        case .hybrid:       return "Hybrid (bridge for complex turns)"
+                        case .alwaysBridge: return "Always bridge"
+                        }
+                    }()
+                    let modeSubtitle: String = {
+                        switch mode {
+                        case .off:
+                            return "Default. No bridge code runs."
+                        case .hybrid:
+                            return "Bridge handles turns your local planner would refuse. Local planner stays for everything else."
+                        case .alwaysBridge:
+                            return canEnableAlwaysBridge
+                                ? "Every planner call routes through the bridge."
+                                : "Available after 24 hours of Hybrid usage."
+                        }
+                    }()
+                    let isDisabled = mode == .alwaysBridge && !canEnableAlwaysBridge
+
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(modeDisplayName)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(isDisabled ? DS.Colors.textTertiary : DS.Colors.textPrimary)
+                            Text(modeSubtitle)
+                                .font(.system(size: 12))
+                                .foregroundColor(DS.Colors.textTertiary)
+                        }
+                        Spacer()
+                        if companionManager.cloudBridgeMode == mode {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(DS.Colors.accent)
+                        }
+                    }
+                    .padding(.vertical, 12)
+                    .opacity(isDisabled ? 0.5 : 1.0)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard !isDisabled else { return }
+                        guard mode != companionManager.cloudBridgeMode else { return }
+
+                        if mode != .off {
+                            let consentAccepted = companionManager.requestCloudBridgeConsentIfNeeded()
+                            guard consentAccepted else {
+                                // User rejected consent — revert mode to off.
+                                companionManager.setCloudBridgeMode(.off)
+                                return
+                            }
+                        }
+                        companionManager.setCloudBridgeMode(mode)
+                    }
+                    .overlay(alignment: .bottom) {
+                        Divider().background(DS.Colors.borderSubtle)
+                    }
+                }
+            }
+
+            Divider().background(DS.Colors.borderSubtle)
+
+            // Upstream picker
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Upstream CLI")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Picker("", selection: Binding(
+                    get: { companionManager.cloudBridgeUpstream },
+                    set: { companionManager.setCloudBridgeUpstream($0) }
+                )) {
+                    ForEach(PaceCloudBridgeUpstream.allCases, id: \.rawValue) { upstream in
+                        Text(upstream.displayLabel).tag(upstream)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+
+            // Model text field
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Model")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                let modelPlaceholder: String = {
+                    switch companionManager.cloudBridgeUpstream {
+                    case .claude:  return "sonnet"
+                    case .codex:   return "gpt-4-1106-preview"
+                    case .gemini:  return "gemini-2.0-flash"
+                    }
+                }()
+
+                TextField(modelPlaceholder, text: Binding(
+                    get: { companionManager.cloudBridgeModel },
+                    set: { companionManager.setCloudBridgeModel($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+            }
+
+            // Bridge URL (read-only)
+            let bridgeURLString = PaceCloudBridgeConsent.loadConfiguration().baseURL.absoluteString
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bridge URL")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text(bridgeURLString)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .textSelection(.enabled)
+                Text("Set via Info.plist key CloudBridgeBaseURL. Must be loopback.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            // Reachability row
+            HStack(spacing: 10) {
+                Group {
+                    if let isReachable = cloudBridgeIsReachable {
+                        Circle()
+                            .fill(isReachable ? DS.Colors.success : DS.Colors.warning)
+                            .frame(width: 8, height: 8)
+                        Text(isReachable ? "Bridge reachable" : "Bridge not reachable")
+                            .font(.system(size: 12))
+                            .foregroundColor(isReachable ? DS.Colors.success : DS.Colors.warning)
+                    } else {
+                        Circle()
+                            .fill(DS.Colors.textTertiary)
+                            .frame(width: 8, height: 8)
+                        Text("Not checked yet")
+                            .font(.system(size: 12))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                }
+
+                if let checkedAt = cloudBridgeReachabilityLastCheckedAt {
+                    Text("(\(checkedAt.formatted(date: .omitted, time: .shortened)))")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+
+                Spacer()
+                settingsButton("Check", systemName: "arrow.clockwise") {
+                    checkCloudBridgeReachability()
+                }
+            }
+
+            Divider().background(DS.Colors.borderSubtle)
+
+            // Revoke consent
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Revoke consent")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Text("Clears all bridge state, resets mode to Off.")
+                        .font(.system(size: 12))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                Spacer()
+                settingsButton("Revoke", systemName: "xmark.circle") {
+                    PaceCloudBridgeConsent.revokeConsentAndResetAllBridgeState()
+                    companionManager.setCloudBridgeMode(.off)
+                }
+            }
+            .padding(.vertical, 8)
+        }
+        .onAppear {
+            checkCloudBridgeReachability()
+        }
+    }
+
+    private func checkCloudBridgeReachability() {
+        let bridgeConfiguration = PaceCloudBridgeConsent.loadConfiguration()
+        let healthURL = bridgeConfiguration.baseURL.appendingPathComponent("health")
+
+        Task {
+            do {
+                let (_, response) = try await URLSession.shared.data(from: healthURL)
+                let httpStatusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                cloudBridgeIsReachable = (200...299).contains(httpStatusCode)
+            } catch {
+                cloudBridgeIsReachable = false
+            }
+            cloudBridgeReachabilityLastCheckedAt = Date()
+        }
+    }
+
+    /// Thread summary subsection. Rendered ABOVE the existing
+    /// episodic / local memory subsection per PRD. Defaults are ON
+    /// for the master switch, OFF for the debug view + the episodic
+    /// handoff. The handoff stays default-OFF because the summarizer
+    /// is loose; the episodic extractor is precise; coupling them
+    /// risks low-confidence facts.
+    private var threadSummarySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Thread summary")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Text("Pace keeps the last few turns verbatim and rolls everything older into a one-paragraph summary so it stays coherent across a long conversation. This conversation only — never saved to disk.")
+                .font(.system(size: 12))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle(isOn: $isThreadMemoryEnabledForSettings) {
+                Text("Remember this conversation")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .onChange(of: isThreadMemoryEnabledForSettings) { _, newValue in
+                PaceUserPreferencesStore.setBool(newValue, for: .isThreadMemoryEnabled)
+                if !newValue {
+                    companionManager.resetThreadMemoryNow()
+                    threadMemoryRefreshTick &+= 1
+                }
+            }
+
+            HStack(spacing: 12) {
+                Text("Verbatim window")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Picker("", selection: $threadMemoryVerbatimWindowSizeForSettings) {
+                    ForEach(1...8, id: \.self) { turnPairCount in
+                        Text("\(turnPairCount) turn pair\(turnPairCount == 1 ? "" : "s")")
+                            .tag(turnPairCount)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 200)
+                .onChange(of: threadMemoryVerbatimWindowSizeForSettings) { _, newValue in
+                    PaceUserPreferencesStore.setInt(newValue, for: .threadMemoryVerbatimWindowSize)
+                }
+            }
+            .help("How much exact context the planner sees before falling back to a summary.")
+
+            HStack(spacing: 12) {
+                Text("Idle threshold")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Picker("", selection: $threadMemoryIdleMinutesForSettings) {
+                    ForEach([5, 10, 15, 20, 30, 45, 60], id: \.self) { idleMinutes in
+                        Text("\(idleMinutes) minutes").tag(idleMinutes)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 200)
+                .onChange(of: threadMemoryIdleMinutesForSettings) { _, newValue in
+                    PaceUserPreferencesStore.setInt(newValue, for: .threadMemoryIdleMinutes)
+                }
+            }
+
+            settingsButton("Reset thread now", systemName: "arrow.counterclockwise") {
+                companionManager.resetThreadMemoryNow()
+                threadMemoryRefreshTick &+= 1
+            }
+
+            Toggle(isOn: $isThreadMemoryDebugViewEnabledForSettings) {
+                Text("Show current summary")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .onChange(of: isThreadMemoryDebugViewEnabledForSettings) { _, newValue in
+                PaceUserPreferencesStore.setBool(newValue, for: .isThreadMemoryDebugViewEnabled)
+            }
+
+            if isThreadMemoryDebugViewEnabledForSettings {
+                let snapshot = companionManager.currentThreadMemorySummarySnapshot()
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Summary version: \(snapshot.summaryVersion)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                    Text(snapshot.summaryText ?? "(no summary yet — verbatim window covers the whole session)")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .id(threadMemoryRefreshTick)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DS.Colors.borderSubtle.opacity(0.25))
+                .cornerRadius(6)
+            }
+
+            Toggle(isOn: $isThreadEndingEpisodicHandoffEnabledForSettings) {
+                Text("On session end, share summary with episodic memory")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .onChange(of: isThreadEndingEpisodicHandoffEnabledForSettings) { _, newValue in
+                PaceUserPreferencesStore.setBool(newValue, for: .isThreadEndingEpisodicHandoffEnabled)
+            }
+            .help("Default off. When on, the final summary is offered to the episodic extractor — the extractor decides whether anything is durable enough to keep.")
+        }
+    }
+
+    private var flowsContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recipe library")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("One-click flows Pace ships out of the box. Install adds them to your saved flows; run them by name.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let lastRecipeActionMessage {
+                    Text(lastRecipeActionMessage)
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.accent)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(bundledRecipesForSettings, id: \.slug) { bundledRecipe in
+                        recipeLibraryRow(bundledRecipe)
+                    }
+                }
+                .id(recipeLibraryRefreshTick)
+            }
+
+            Divider()
+                .background(DS.Colors.borderSubtle)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Saved flows")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Flows you've recorded, plus any recipes installed above. Use \"do <name>\" to run.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                savedFlowsList
+            }
+        }
+        .onAppear {
+            reloadRecipeLibrary()
+        }
+    }
+
+    private func recipeLibraryRow(_ bundledRecipe: PaceBundledRecipe) -> some View {
+        let isAlreadyInstalled = installedRecipeSlugsForSettings.contains(bundledRecipe.slug)
+        let missingPreferenceKeys = bundledRecipe.requiredPreferences.filter { requiredPreferenceKey in
+            guard let resolvedKey = PaceLocalMemoryKey(rawValue: requiredPreferenceKey) else {
+                return true
+            }
+            return PaceLocalMemoryStore.string(for: resolvedKey) == nil
+        }
+        let canInstallNow = missingPreferenceKeys.isEmpty
+
+        return HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(bundledRecipe.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                Text(bundledRecipe.description)
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !canInstallNow {
+                    Text("Set \(missingPreferenceKeys.joined(separator: ", ")) in preferences first.")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.warning)
+                }
+            }
+            Spacer()
+            if isAlreadyInstalled {
+                settingsButton("Uninstall", systemName: "minus.circle") {
+                    uninstallRecipeFromSettings(bundledRecipe)
+                }
+            } else {
+                settingsButton("Install", systemName: "plus.circle") {
+                    installRecipeFromSettings(bundledRecipe)
+                }
+                .disabled(!canInstallNow)
+                .opacity(canInstallNow ? 1 : 0.45)
+                .help(canInstallNow
+                      ? "Save this recipe into your flows."
+                      : "Missing preference: \(missingPreferenceKeys.joined(separator: ", "))")
+            }
+        }
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            Divider()
+                .background(DS.Colors.borderSubtle)
+        }
+    }
+
+    private var savedFlowsList: some View {
+        let savedFlows = PaceFlowStore().listAll()
+        return Group {
+            if savedFlows.isEmpty {
+                Text("No saved flows yet.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(savedFlows) { savedFlow in
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(savedFlow.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(DS.Colors.textPrimary)
+                                Text("\(savedFlow.steps.count) steps")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(DS.Colors.textTertiary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 8)
+                        .overlay(alignment: .bottom) {
+                            Divider()
+                                .background(DS.Colors.borderSubtle)
+                        }
+                    }
+                }
+            }
+        }
+        .id(recipeLibraryRefreshTick)
+    }
+
+    private func reloadRecipeLibrary() {
+        bundledRecipesForSettings = PaceRecipeLibrary.loadBundledRecipes()
+        recomputeInstalledRecipeSlugs()
+    }
+
+    private func recomputeInstalledRecipeSlugs() {
+        let flowStore = PaceFlowStore()
+        let installedSlugs = bundledRecipesForSettings
+            .filter { PaceRecipeLibrary.isInstalled($0, in: flowStore) }
+            .map { $0.slug }
+        installedRecipeSlugsForSettings = Set(installedSlugs)
+    }
+
+    private func installRecipeFromSettings(_ bundledRecipe: PaceBundledRecipe) {
+        do {
+            try PaceRecipeLibrary.install(bundledRecipe, into: PaceFlowStore())
+            lastRecipeActionMessage = "Installed \(bundledRecipe.name)."
+        } catch PaceRecipeInstallError.missingRequiredPreference(let requiredPreferenceKey) {
+            lastRecipeActionMessage = "Set \(requiredPreferenceKey) in preferences before installing."
+        } catch PaceRecipeInstallError.alreadyInstalled {
+            lastRecipeActionMessage = "\(bundledRecipe.name) is already installed."
+        } catch {
+            lastRecipeActionMessage = "Couldn't install \(bundledRecipe.name)."
+        }
+        recomputeInstalledRecipeSlugs()
+        recipeLibraryRefreshTick &+= 1
+    }
+
+    private func uninstallRecipeFromSettings(_ bundledRecipe: PaceBundledRecipe) {
+        PaceRecipeLibrary.uninstall(slug: bundledRecipe.slug, from: PaceFlowStore())
+        lastRecipeActionMessage = "Removed \(bundledRecipe.name)."
+        recomputeInstalledRecipeSlugs()
+        recipeLibraryRefreshTick &+= 1
+    }
+
     private var activityContent: some View {
         VStack(alignment: .leading, spacing: 16) {
+            threadSummarySection
+
+            Divider()
+                .background(DS.Colors.borderSubtle)
+
             VStack(alignment: .leading, spacing: 8) {
                 Text("Local memory")
                     .font(.system(size: 13, weight: .semibold))

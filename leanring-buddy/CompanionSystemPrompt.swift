@@ -40,16 +40,31 @@ import Foundation
 
 enum CompanionSystemPrompt {
     /// Build the system prompt for the next request.
-    /// - Parameter includeAgentMode: pass `true` only when
-    ///   `EnableActions=true` is set in Info.plist. Adds ~700 tokens
-    ///   of action-tag + plan-act-observe instructions. Skipped in
-    ///   the default (read-only) configuration to keep TTFT down.
-    static func build(includeAgentMode: Bool) -> String {
+    /// - Parameters:
+    ///   - includeAgentMode: pass `true` only when
+    ///     `EnableActions=true` is set in Info.plist. Adds ~700
+    ///     tokens of action-tag + plan-act-observe instructions.
+    ///     Skipped in the default (read-only) configuration to keep
+    ///     TTFT down.
+    ///   - threadSummaryInjection: optional leading addendum that
+    ///     summarizes everything older than the verbatim window. When
+    ///     non-nil this is the literal block
+    ///     `<conversation_so_far>...</conversation_so_far>` produced
+    ///     by `PaceThreadMemory.injectionPrefix()`. Same wrapper tags
+    ///     flow through every planner tier so the tier picker never
+    ///     forks per-tier behavior.
+    static func build(
+        includeAgentMode: Bool,
+        threadSummaryInjection: String? = nil
+    ) -> String {
         var assembledPrompt = baseVoiceRules + "\n\n" + pointingRules
         if includeAgentMode {
             assembledPrompt += "\n\n" + agentModeRules
         }
-        return assembledPrompt
+        return prependingThreadSummaryInjection(
+            threadSummaryInjection,
+            to: assembledPrompt
+        )
     }
 
     /// Prompt for text-only answer turns (pure knowledge, journal recall).
@@ -58,8 +73,29 @@ enum CompanionSystemPrompt {
     /// list, and on a screenless turn there IS no element list — a small
     /// greedy-sampled model will follow that drilled template even when
     /// LOCAL CONTEXT holds the answer. Also saves ~250 tokens of prefill.
-    static func buildTextOnly() -> String {
-        baseVoiceRules
+    /// - Parameter threadSummaryInjection: see `build(includeAgentMode:
+    ///   threadSummaryInjection:)`.
+    static func buildTextOnly(
+        threadSummaryInjection: String? = nil
+    ) -> String {
+        return prependingThreadSummaryInjection(
+            threadSummaryInjection,
+            to: baseVoiceRules
+        )
+    }
+
+    /// Stable prefix layout: the thread summary block always sits
+    /// BEFORE the persona / tool / pointing rules so the v10 schema
+    /// fixtures and prompt-cache stability can pin both ends.
+    private static func prependingThreadSummaryInjection(
+        _ threadSummaryInjection: String?,
+        to assembledPrompt: String
+    ) -> String {
+        guard let threadSummaryInjection,
+              !threadSummaryInjection.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return assembledPrompt
+        }
+        return threadSummaryInjection + "\n\n" + assembledPrompt
     }
 
     // MARK: - Block 1: always-present voice rules
@@ -183,6 +219,8 @@ enum CompanionSystemPrompt {
     - [BRIGHTNESS:up]           raise display brightness. [BRIGHTNESS:down:3] lowers by 3 steps.
 
     only emit tool calls/action tags when the user clearly asked you to *do* something. when unsure, point and ask.
+
+    recipe library: pace ships pre-built flows (morning standup setup, weekly review note, inbox triage pass, focus mode on, end-of-day shutdown). if the user describes one, mention they can install it by saying "install the <name> recipe" — don't install it yourself.
 
     plan-act-observe loop — for multi-step tasks where each step depends on what happened (e.g. "open file menu then click recent then pick the first one"), DON'T chain everything in one response:
     1. emit just THIS step's tool_calls/action tags + a one-sentence narration ("opening the file menu").

@@ -168,7 +168,12 @@ private struct PaceMenuBarOverlayView: View {
                         isConversationActive: isConversationActive,
                         voiceState: companionManager.voiceState,
                         audioPowerLevel: companionManager.currentAudioPowerLevel,
-                        reduceMotion: reduceMotion
+                        reduceMotion: reduceMotion,
+                        // The amber tint fires for ANY non-Local tier in
+                        // flight (cliBridge OR directAPI), not just the
+                        // CLI bridge — so every off-device turn is
+                        // visually called out. See planner-tier-picker.md.
+                        isCloudBridgeCallActive: companionManager.isOffDeviceTurnInFlight
                     )
                 }
             }
@@ -262,6 +267,9 @@ private struct PaceMenuBarSoundGlyph: View {
     let voiceState: CompanionVoiceState
     let audioPowerLevel: CGFloat
     let reduceMotion: Bool
+    /// When true, tints the right-icon slot amber (#FFB347) to show that a
+    /// cloud-bridge call is actively streaming. Makes egress always visible.
+    let isCloudBridgeCallActive: Bool
 
     var body: some View {
         ZStack {
@@ -269,13 +277,18 @@ private struct PaceMenuBarSoundGlyph: View {
                 PaceMenuBarSoundBars(
                     voiceState: voiceState,
                     audioPowerLevel: audioPowerLevel,
-                    reduceMotion: reduceMotion
+                    reduceMotion: reduceMotion,
+                    isCloudBridgeCallActive: isCloudBridgeCallActive
                 )
                 .transition(reduceMotion ? .identity : .scale(scale: 0.76, anchor: .trailing).combined(with: .opacity))
             } else {
                 Image(systemName: "speaker.wave.2.fill")
                     .font(.system(size: 12.2, weight: .bold))
-                    .foregroundStyle(Color(hex: "#67E8F9").opacity(0.95))
+                    .foregroundStyle(
+                        isCloudBridgeCallActive
+                            ? Color(hex: "#FFB347").opacity(0.95)
+                            : Color(hex: "#67E8F9").opacity(0.95)
+                    )
                     .transition(reduceMotion ? .identity : .scale(scale: 0.82, anchor: .trailing).combined(with: .opacity))
             }
         }
@@ -286,6 +299,9 @@ private struct PaceMenuBarSoundBars: View {
     let voiceState: CompanionVoiceState
     let audioPowerLevel: CGFloat
     let reduceMotion: Bool
+    /// When true, bars render in amber (#FFB347) instead of the default cyan/blue
+    /// gradient to signal that a cloud-bridge call is in flight.
+    let isCloudBridgeCallActive: Bool
 
     private let barHeightProfile: [CGFloat] = [0.46, 0.76, 1.0, 0.76, 0.46]
 
@@ -308,16 +324,18 @@ private struct PaceMenuBarSoundBars: View {
     }
 
     private func soundBar(at barIndex: Int, height: CGFloat) -> some View {
-        RoundedRectangle(cornerRadius: 1.1, style: .continuous)
+        let topBarColor = isCloudBridgeCallActive ? Color(hex: "#FFB347") : activeAccentColor
+        let bottomBarColor = isCloudBridgeCallActive ? Color(hex: "#FF8C00") : Color(hex: "#67E8F9")
+        return RoundedRectangle(cornerRadius: 1.1, style: .continuous)
             .fill(
                 LinearGradient(
-                    colors: [activeAccentColor, Color(hex: "#67E8F9")],
+                    colors: [topBarColor, bottomBarColor],
                     startPoint: .top,
                     endPoint: .bottom
                 )
             )
             .frame(width: 2.3, height: height)
-            .shadow(color: activeAccentColor.opacity(reduceMotion ? 0.22 : 0.42), radius: reduceMotion ? 1.5 : 3, x: 0, y: 0)
+            .shadow(color: topBarColor.opacity(reduceMotion ? 0.22 : 0.42), radius: reduceMotion ? 1.5 : 3, x: 0, y: 0)
     }
 
     private func animatedBarHeight(for barIndex: Int, at date: Date) -> CGFloat {
