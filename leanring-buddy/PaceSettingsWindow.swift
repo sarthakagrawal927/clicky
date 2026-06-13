@@ -863,10 +863,22 @@ struct PaceSettingsWindowView: View {
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(
+                    "Always-Listening (wake word)",
+                    isOn: Binding(
+                        get: { companionManager.isAlwaysListeningEnabled },
+                        set: { companionManager.setAlwaysListeningEnabled($0) }
+                    )
+                )
+                Text("Audio buffer never persists. Battery impact ~5% per 3-hour session.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer()
-            // Wave 2 adds always-listening + episodic memory access
+            // Wave 2 adds episodic memory access
         }
     }
 

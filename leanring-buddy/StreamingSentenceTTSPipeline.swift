@@ -57,6 +57,22 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// voice turn.
     private var isMutedForCurrentTurn: Bool = false
 
+    /// True once `drainQueueAndStopForBargeIn()` has been called for the
+    /// current turn. Locks out any further `dispatchDeltaIfReady` work
+    /// for THIS turn so speculative sentences arriving after the user
+    /// interrupted (e.g. a planner chunk still in flight, or a Wave 4
+    /// speculative prefetch result) cannot leak audio. Cleared on the
+    /// next `markIntentCommitted()` so the next turn starts clean.
+    private var hasBeenDrainedForBargeInThisTurn: Bool = false
+
+    /// Public read of whether the LAST completed turn was interrupted
+    /// by a barge-in. Tests assert on this; the CompanionManager uses
+    /// it when journaling the interrupt line. Reset on the next
+    /// `markIntentCommitted()` call, which represents the user
+    /// committing the NEXT turn's intent — at that point the previous
+    /// turn's "was interrupted" state is no longer relevant.
+    @Published private(set) var lastTurnWasInterrupted: Bool = false
+
     init(ttsClient: any BuddyTTSClient) {
         self.ttsClient = ttsClient
     }
@@ -69,6 +85,7 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         hasLoggedTimeToFirstSpokenWord = false
         isMutedForCurrentTurn = false
         inFlightStreamedText = ""
+        hasBeenDrainedForBargeInThisTurn = false
     }
 
     /// Sets the per-turn mute flag. Called by `CompanionManager` right
@@ -82,9 +99,43 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// release). The pipeline measures from this point to the first
     /// dispatched TTS utterance and logs it as time-to-first-spoken-
     /// word — the headline latency metric on the product positioning.
+    /// Also clears `lastTurnWasInterrupted` because a new intent
+    /// commit means the prior turn's interrupted state is no longer
+    /// meaningful — the user has moved on.
     func markIntentCommitted() {
         intentCommittedAt = Date()
         hasLoggedTimeToFirstSpokenWord = false
+        lastTurnWasInterrupted = false
+        hasBeenDrainedForBargeInThisTurn = false
+    }
+
+    /// Barge-in entry point: empties the in-memory sentence queue, stops
+    /// the current sentence on the underlying TTS client, and locks the
+    /// pipeline so any speculative sentence (Wave 4's prefetch results,
+    /// in-flight planner stream chunks that arrive after the user
+    /// interrupted) is discarded on arrival. Distinct from regular
+    /// `ttsClient.stopPlayback()` because regular stop doesn't prevent
+    /// new sentences from being submitted — this method also guards
+    /// against subsequent `acceptStreamedText` calls within the SAME
+    /// turn so audio cannot resume after a barge-in.
+    ///
+    /// Publishes `lastTurnWasInterrupted = true` so the CompanionManager
+    /// can include the flag in the paceHistory interrupt log line. Resets
+    /// on `markIntentCommitted()` for the next turn.
+    func drainQueueAndStopForBargeIn() {
+        // Pre-stamp the stop reason BEFORE stopping. The client's
+        // stopPlayback() reads the pending reason and propagates it
+        // to `lastStopReason` — so a CompanionManager post-stop read
+        // sees `.userBargeIn` instead of `.manualStop`.
+        ttsClient.recordExpectedStopReason(.userBargeIn)
+        // Stop in-flight playback first so the user hears silence
+        // immediately, then mark the lock so subsequent
+        // `dispatchDeltaIfReady` calls skip without speaking. Order
+        // matters: a chunk landing between these two lines should be
+        // dropped, which the flag below ensures.
+        ttsClient.stopPlayback()
+        hasBeenDrainedForBargeInThisTurn = true
+        lastTurnWasInterrupted = true
     }
 
     /// Call on every planner-stream chunk. Computes the new
@@ -115,6 +166,13 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         if speakableSafePrefix != inFlightStreamedText {
             inFlightStreamedText = speakableSafePrefix
         }
+
+        // Barge-in lock: once the user has interrupted, no more audio
+        // for THIS turn. The chat-stream publisher above still updates
+        // so the text UI sees the rest of the planner output, but the
+        // TTS path is silenced — matches the user's expressed intent
+        // to stop hearing the response.
+        guard !hasBeenDrainedForBargeInThisTurn else { return }
 
         guard speakableSafePrefix.count > alreadyDispatchedSafeText.count else { return }
 

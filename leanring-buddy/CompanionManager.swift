@@ -446,6 +446,17 @@ final class CompanionManager: ObservableObject {
     private var chatShortcutCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
+
+    /// Wave 1c barge-in plumbing. The VAD is a mutable struct; we hold
+    /// it through a class wrapper-style storage (the `var` here works
+    /// because CompanionManager is itself a class) so the subscription
+    /// path can call `observe(...)` mutably. The subscription is
+    /// attached only when both gates fire — `voiceState == .responding`
+    /// AND `isAlwaysListeningEnabled == true` — and is torn down the
+    /// instant either flips, so the VAD never sees stale audio.
+    private var bargeInVAD = PaceBargeInVAD()
+    private var bargeInAudioLevelCancellable: AnyCancellable?
+    private var bargeInGatePropertyCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var lmStudioReachabilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
@@ -2870,6 +2881,7 @@ You can turn this off at any time in Settings → Cloud bridge.
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        bindBargeInGateObservation()
         // Eagerly touch the planner so the LM Studio cold-load (model
         // swap, first connection) happens before the user's first
         // push-to-talk rather than blocking on it.
@@ -2982,6 +2994,9 @@ You can turn this off at any time in Settings → Cloud bridge.
         chatShortcutCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
+        bargeInGatePropertyCancellable?.cancel()
+        bargeInGatePropertyCancellable = nil
+        detachBargeInAudioLevelSubscription()
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = nil
         remindersRetrievalRefreshTask?.cancel()
@@ -3270,6 +3285,109 @@ You can turn this off at any time in Settings → Cloud bridge.
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
             }
+    }
+
+    /// Wires the two-condition gate that controls the barge-in
+    /// subscription. Either `voiceState` flipping or
+    /// `isAlwaysListeningEnabled` flipping reruns the decision; the
+    /// VAD audio-level subscription is attached only when BOTH are
+    /// satisfied (state is `.responding` AND wake-word/always-listening
+    /// is enabled). On any other state combination the subscription
+    /// is torn down immediately and the VAD's accumulated speech window
+    /// is reset, so background noise during `.idle` cannot accidentally
+    /// fire a stale interrupt the next time the gate opens.
+    private func bindBargeInGateObservation() {
+        bargeInGatePropertyCancellable = $voiceState
+            .combineLatest($isAlwaysListeningEnabled)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state, isEnabled in
+                guard let self else { return }
+                let shouldAttach = state == .responding && isEnabled
+                if shouldAttach {
+                    self.attachBargeInAudioLevelSubscriptionIfNeeded()
+                } else {
+                    self.detachBargeInAudioLevelSubscription()
+                }
+            }
+    }
+
+    /// Attaches the VAD audio-level subscription. Idempotent — if a
+    /// subscription is already live, we leave it alone (cancelling and
+    /// re-attaching would drop in-flight RMS samples and reset the
+    /// sustained-speech window). The publisher emits on the audio
+    /// thread; we hop to MainActor inside the sink because the VAD
+    /// observation, the TTS drain, the PTT manager call, and the
+    /// retrieval journal write are all main-actor work.
+    private func attachBargeInAudioLevelSubscriptionIfNeeded() {
+        guard bargeInAudioLevelCancellable == nil else { return }
+        bargeInVAD.reset()
+        bargeInAudioLevelCancellable = buddyDictationManager.audioLevelPublisher
+            .sink { [weak self] normalizedLevel in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.observeBargeInAudioLevel(normalizedLevel)
+                }
+            }
+    }
+
+    private func detachBargeInAudioLevelSubscription() {
+        bargeInAudioLevelCancellable?.cancel()
+        bargeInAudioLevelCancellable = nil
+        bargeInVAD.reset()
+    }
+
+    /// Forwards a single RMS sample to the VAD. Fires the barge-in
+    /// callback chain when the VAD reports sustained speech. The
+    /// double-gate check inside the sink guards against an in-flight
+    /// sample arriving on the main-actor hop just after voiceState
+    /// flipped out of `.responding` — we re-check the conditions here
+    /// because the publisher sample raced the state change.
+    private func observeBargeInAudioLevel(_ normalizedLevel: Float) {
+        guard voiceState == .responding, isAlwaysListeningEnabled else { return }
+        let didDetectSustainedSpeech = bargeInVAD.observe(
+            normalizedLevel: normalizedLevel,
+            at: Date()
+        )
+        guard didDetectSustainedSpeech else { return }
+        // Reset immediately so a continued speech burst doesn't fire
+        // the chain twice for the same interrupt.
+        bargeInVAD.reset()
+        handleBargeInDetected()
+    }
+
+    /// Wave 1c barge-in callback chain. Called from
+    /// `observeBargeInAudioLevel` once the VAD confirms sustained user
+    /// speech during TTS playback. Drains the speech queue, opens a
+    /// fresh listening window so the user's interrupting words can
+    /// land as the next turn, and journals the interrupt to
+    /// paceHistory using the speakable prefix that was already on its
+    /// way out the speakers when the user cut in.
+    private func handleBargeInDetected() {
+        let lastSpokenPrefix = streamingSentenceTTSPipeline.inFlightStreamedText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Drain + stop. The pipeline pre-stamps `.userBargeIn` on the
+        // TTS client so the next `lastStopReason` read is correct.
+        streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+        // Belt-and-braces: call stop directly on the client too, since
+        // the pipeline already routed it but a second call is a no-op
+        // and guarantees state even if the pipeline shape changes.
+        ttsClient.stopPlayback()
+        // Open a listening window so the wake-word path (Wave 2) or
+        // an immediate PTT press resumes capture without re-arming.
+        buddyDictationManager.openListeningWindow(
+            durationInSeconds: 6,
+            trigger: .bargeIn
+        )
+        // Journal the interrupt locally. `paceHistory` is the existing
+        // retrieval source; no new tracking, no new files.
+        let prefixForJournalLine = lastSpokenPrefix.isEmpty
+            ? "(no prefix captured)"
+            : lastSpokenPrefix
+        localRetriever.recordPaceHistory(
+            userTranscript: "(system) barge-in interrupted assistant turn",
+            assistantResponse: "[interrupted-mid-speech] \(prefixForJournalLine)"
+        )
+        refreshLocalRetrievalPublishedState()
     }
 
     private func bindVoiceStateObservation() {

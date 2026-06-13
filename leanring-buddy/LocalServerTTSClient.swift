@@ -107,6 +107,19 @@ final class LocalServerTTSClient: NSObject, BuddyTTSClient {
     private var audioPlayer: AVAudioPlayer?
     private var playbackContinuation: CheckedContinuation<Void, Never>?
     private var serverUnavailableUntil: Date?
+    /// Why playback last ended. The fallback client (Apple voice) has
+    /// its own `lastStopReason`; the value here reflects whichever
+    /// path actually stopped. Barge-in pre-stamps via
+    /// `recordExpectedStopReason(.userBargeIn)`.
+    private(set) var lastStopReason: PaceTTSStopReason = .naturalCompletion
+    private var pendingNextStopReason: PaceTTSStopReason?
+
+    func recordExpectedStopReason(_ reason: PaceTTSStopReason) {
+        pendingNextStopReason = reason
+        // Forward to fallback so the Apple path agrees with us if
+        // it ended up handling this turn's playback instead.
+        fallbackClient.recordExpectedStopReason(reason)
+    }
     /// Set true on the FIRST sidecar synthesis failure of the current
     /// outage, cleared on next successful synthesis. CompanionManager
     /// inspects this at end of turn to decide whether to speak the
@@ -179,11 +192,18 @@ final class LocalServerTTSClient: NSObject, BuddyTTSClient {
     func speakText(_ text: String) async throws {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
+        // Fresh sentence → previous stop reason no longer applies.
+        lastStopReason = .naturalCompletion
+        pendingNextStopReason = nil
         pendingUtteranceQueue.append(PendingUtterance(text: trimmedText))
         startDrainingPlaybackQueueIfNeeded()
     }
 
     func stopPlayback() {
+        // Honor the pre-stamped reason set by the streaming pipeline's
+        // barge-in path; otherwise treat as manual stop.
+        lastStopReason = pendingNextStopReason ?? .manualStop
+        pendingNextStopReason = nil
         pendingUtteranceQueue = []
         audioPlayer?.stop()
         audioPlayer = nil
