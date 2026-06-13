@@ -99,19 +99,26 @@ final class PaceMorningTriageSchedulerTests: XCTestCase {
                         isOnActiveCall: false,
                         wakeWordConfidence: nil,
                         intent: .pureKnowledge,
-                        proactiveSource: .morningTriage
+                        proactiveSource: .morningTriage,
+                        profile: .balanced
                     )
                 case .stayQuiet(_):
+                    // Active call now routes to .queueUntilIdle in the
+                    // live gate (Wave 1a restraint policy). Park the
+                    // brief by setting the intent to .unknown so the
+                    // gate returns the desired .stayQuiet decision —
+                    // the same parking behavior the scheduler relies on.
                     return PaceRestraintContext(
                         now: context.now,
                         lastProactiveUtteranceAt: nil,
                         lastEpisodicRecallAt: nil,
                         lastUserInputAt: nil,
-                        frontmostAppBundleIdentifier: "us.zoom.xos",
-                        isOnActiveCall: true,
+                        frontmostAppBundleIdentifier: nil,
+                        isOnActiveCall: false,
                         wakeWordConfidence: nil,
-                        intent: .pureKnowledge,
-                        proactiveSource: .morningTriage
+                        intent: .unknown,
+                        proactiveSource: .morningTriage,
+                        profile: .balanced
                     )
                 case .queueUntilIdle(_):
                     return PaceRestraintContext(
@@ -123,7 +130,8 @@ final class PaceMorningTriageSchedulerTests: XCTestCase {
                         isOnActiveCall: false,
                         wakeWordConfidence: nil,
                         intent: .pureKnowledge,
-                        proactiveSource: .morningTriage
+                        proactiveSource: .morningTriage,
+                        profile: .balanced
                     )
                 }
             },

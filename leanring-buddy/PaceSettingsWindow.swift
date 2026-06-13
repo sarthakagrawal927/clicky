@@ -47,6 +47,7 @@ final class PaceSettingsWindowManager {
 private enum PaceSettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
     case planner = "Planner"
+    case proactive = "Proactive"
     case mcp = "MCP"
     case permissions = "Permissions"
     case voice = "Voice"
@@ -62,6 +63,8 @@ private enum PaceSettingsTab: String, CaseIterable, Identifiable {
             return "switch.2"
         case .planner:
             return "brain.head.profile"
+        case .proactive:
+            return "bell.badge"
         case .mcp:
             return "point.3.connected.trianglepath.dotted"
         case .permissions:
@@ -206,6 +209,8 @@ struct PaceSettingsWindowView: View {
                     generalContent
                 case .planner:
                     plannerContent
+                case .proactive:
+                    proactiveContent
                 case .mcp:
                     mcpContent
                 case .permissions:
@@ -768,6 +773,62 @@ struct PaceSettingsWindowView: View {
                 lastDirectAPITestOutcomeText = testError.localizedDescription
             }
             isDirectAPITestInFlight = false
+        }
+    }
+
+    // MARK: - Proactive tab
+    //
+    // The proactivity profile picker is the only control here in
+    // Wave 1a. Wave 1b adds nudge toggles (focus fatigue, calendar,
+    // watch observation, posture) below; Wave 2 adds always-listening
+    // + episodic memory access. The spacer leaves a clear insertion
+    // point so the next agent knows exactly where to extend.
+    private var proactiveContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Proactivity Profile")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("How often Pace can speak up on its own. Affects every proactive surface (focus nudges, calendar lead-time prompts, watch-mode observations, the morning brief).")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Picker(
+                    "Proactivity profile",
+                    selection: Binding(
+                        get: { companionManager.proactivityProfile },
+                        set: { companionManager.setProactivityProfile($0) }
+                    )
+                ) {
+                    Text("Talkative").tag(PaceProactivityProfile.talkative)
+                    Text("Balanced").tag(PaceProactivityProfile.balanced)
+                    Text("Reserved").tag(PaceProactivityProfile.reserved)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(proactivityProfileDescription(for: companionManager.proactivityProfile))
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer()
+            // Wave 1b adds nudge toggles here, Wave 2 adds always-listening + episodic memory access
+        }
+    }
+
+    private func proactivityProfileDescription(for profile: PaceProactivityProfile) -> String {
+        switch profile {
+        case .talkative:
+            return "Talkative: shorter cooldowns (about 5 minutes between proactive utterances)."
+        case .balanced:
+            return "Balanced: default cooldowns (about 10 minutes between proactive utterances). Recommended for most users."
+        case .reserved:
+            return "Reserved: longer cooldowns (about 30 minutes between proactive utterances). Pace stays mostly quiet."
         }
     }
 

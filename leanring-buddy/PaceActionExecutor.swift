@@ -4480,7 +4480,8 @@ enum PaceActionTagParser {
 
         for match in actionTagMatches {
             guard let nameRange = Range(match.range(at: 1), in: responseText),
-                  let payloadRange = Range(match.range(at: 2), in: responseText) else {
+                  let payloadRange = Range(match.range(at: 2), in: responseText),
+                  let fullMatchRange = Range(match.range, in: responseText) else {
                 continue
             }
             let tagName = String(responseText[nameRange]).uppercased()
@@ -4490,7 +4491,7 @@ enum PaceActionTagParser {
                 continue
             }
 
-            let sourceOffset = responseText.distance(from: responseText.startIndex, to: match.range.lowerBound)
+            let sourceOffset = responseText.distance(from: responseText.startIndex, to: fullMatchRange.lowerBound)
             orderedSteps.append(OrderedActionStep(
                 sourceOffset: sourceOffset,
                 parseOrder: parseOrder,
@@ -4508,10 +4509,14 @@ enum PaceActionTagParser {
             }
             .map(\.step)
         let allActions = executionSteps.flatMap(\.actions)
+        let actionTagStringRanges: [Range<String.Index>] = actionTagMatches.compactMap { match in
+            Range(match.range, in: responseText)
+        }
         let cleanedSpokenText = stripRanges(
             in: responseText,
-            removingRanges: toolCallRanges + actionTagMatches.map(\.range)
+            removingRanges: toolCallRanges + actionTagStringRanges
         )
+        .replacingOccurrences(of: "\n+", with: " ", options: .regularExpression)
         .trimmingCharacters(in: .whitespacesAndNewlines)
 
         return PaceActionTagParseResult(
@@ -5366,8 +5371,10 @@ enum PaceActionTagParser {
     ) -> String {
         var strippedText = text
         for range in ranges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
-            guard let mutableRange = Range(range, in: strippedText) else { continue }
-            strippedText.removeSubrange(mutableRange)
+            // The String.Index range was computed against `text`; safe
+            // to apply to `strippedText` as long as we sort highest-
+            // first (which keeps earlier indices stable as we mutate).
+            strippedText.removeSubrange(range)
         }
         return strippedText
     }

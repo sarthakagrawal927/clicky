@@ -154,6 +154,21 @@ final class CompanionManager: ObservableObject {
     /// chat input — the keystroke entry point for typists who don't
     /// want to open the main window first.
     let globalChatShortcutMonitor = GlobalChatShortcutMonitor()
+
+    /// Stamps the timestamp of the most recent user mouse / keyboard /
+    /// scroll event. Read by `buildMorningTriageRestraintContext`,
+    /// `buildFailureRestraintContext`, and `drainProactiveQueueIfIdle`
+    /// so a proactive nudge that lands while the user is mid-input
+    /// gets queued instead of barging in. Lifecycle is tied to the
+    /// monitor / detector pair below — both start in `start()` and
+    /// stop in `stop()`.
+    let userInputActivityMonitor = PaceUserInputActivityMonitor()
+
+    /// Polls running applications for known call-app bundle
+    /// identifiers (Zoom, Teams, FaceTime, Slack) every five seconds.
+    /// Combined with the input-activity monitor, this gives the
+    /// restraint gate a "user is busy" signal without permission cost.
+    let activeCallDetector = PaceActiveCallDetector()
     /// Drives the chat input visibility inside the notch panel. Set
     /// `true` when the chat shortcut fires; the panel renders a
     /// TextField bound to `@FocusState` keyed on this flag. Cleared
@@ -842,6 +857,108 @@ You can turn this off at any time in Settings → Cloud bridge.
         PaceUserPreferencesStore.setBool(enabled, for: .areWatchObservationNudgesEnabled)
     }
 
+    // MARK: - Proactivity profile
+
+    /// User-tunable proactive-speech assertiveness. Default `.balanced`
+    /// matches the PRD's original cooldown values; `.talkative`
+    /// shortens cooldowns; `.reserved` lengthens them. The picker
+    /// lives in Settings → Proactive. Read by the proactive context
+    /// builders so the gate's `cooldownSeconds(forProfile:...)` table
+    /// applies the user's preference on every gate decision.
+    @Published var proactivityProfile: PaceProactivityProfile = PaceUserPreferencesStore.proactivityProfile() {
+        didSet {
+            guard oldValue != proactivityProfile else { return }
+            PaceUserPreferencesStore.setProactivityProfile(proactivityProfile)
+        }
+    }
+
+    func setProactivityProfile(_ profile: PaceProactivityProfile) {
+        proactivityProfile = profile
+    }
+
+    // MARK: - Proactive utterance queue + idle drain
+    //
+    // When the gate returns `.queueUntilIdle` (user is mid-input or on
+    // a call), the manager parks the utterance here and lets the
+    // 10-second drain timer try again. The queue is intentionally
+    // tiny — three entries — so a long busy period doesn't lead to a
+    // burst of stale nudges the moment the user pauses.
+
+    /// Capped FIFO of nudges waiting for the user to pause. Cap is 3
+    /// — the oldest entry gets dropped on overflow. Mutations only
+    /// happen on the main actor; no separate lock needed.
+    private(set) var proactiveUtteranceQueue: [PaceProactiveUtterance] = []
+
+    /// Maximum entries kept in the queue. Above this the oldest is
+    /// dropped so a busy hour doesn't produce a five-utterance burst.
+    private static let proactiveUtteranceQueueMaximumCapacity: Int = 3
+
+    /// Backs the 10-second drain loop. Started in `start()`, torn
+    /// down in `stop()`. Each tick attempts at most one utterance —
+    /// the next tick handles the rest so we never speak two nudges
+    /// back-to-back in a single drain pass.
+    private var proactiveQueueDrainTimer: Timer?
+
+    /// Adds an utterance to the proactive queue, dropping the oldest
+    /// entry once the cap is exceeded. Exposed for nudge generators
+    /// and the morning-triage scheduler — both should call this when
+    /// the gate returns `.queueUntilIdle` instead of speaking
+    /// directly.
+    func enqueueProactiveUtterance(_ utterance: PaceProactiveUtterance) {
+        proactiveUtteranceQueue.append(utterance)
+        if proactiveUtteranceQueue.count > Self.proactiveUtteranceQueueMaximumCapacity {
+            proactiveUtteranceQueue.removeFirst(
+                proactiveUtteranceQueue.count - Self.proactiveUtteranceQueueMaximumCapacity
+            )
+        }
+    }
+
+    /// Test seam: read the queue contents without depending on
+    /// internal ordering invariants.
+    func proactiveUtteranceQueueSnapshot() -> [PaceProactiveUtterance] {
+        return proactiveUtteranceQueue
+    }
+
+    /// Speaks the oldest queued nudge if all three idle signals say
+    /// "now is a good time": no recent input, not on a call, voice
+    /// turn idle. Otherwise leaves the queue untouched for the next
+    /// tick. Called by the drain timer; safe to call manually.
+    func drainProactiveQueueIfIdle(now: Date = Date()) {
+        guard proactiveUtteranceQueue.isEmpty == false else { return }
+
+        if let lastUserInputAt = userInputActivityMonitor.lastUserInputAt,
+           now.timeIntervalSince(lastUserInputAt) < PaceRestraintGate.activeInputWindowSeconds {
+            return
+        }
+        if activeCallDetector.isOnActiveCall {
+            return
+        }
+        guard voiceState == .idle else { return }
+
+        let nextUtterance = proactiveUtteranceQueue.removeFirst()
+        Task { @MainActor in
+            do {
+                try await ttsClient.speakText(nextUtterance.spokenText)
+            } catch {
+                print("⚠️ Proactive queue drain TTS failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static let proactiveQueueDrainIntervalSeconds: TimeInterval = 10
+
+    private func startProactiveQueueDrainTimer() {
+        proactiveQueueDrainTimer?.invalidate()
+        proactiveQueueDrainTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.proactiveQueueDrainIntervalSeconds,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.drainProactiveQueueIfIdle()
+            }
+        }
+    }
+
     // MARK: - Morning triage (daily brief)
 
     /// User-facing master switch for the daily weekday morning brief.
@@ -915,7 +1032,8 @@ You can turn this off at any time in Settings → Cloud bridge.
                         isOnActiveCall: false,
                         wakeWordConfidence: nil,
                         intent: .pureKnowledge,
-                        proactiveSource: .morningTriage
+                        proactiveSource: .morningTriage,
+                        profile: .balanced
                     )
                 }
                 return self.buildMorningTriageRestraintContext(forNow: context.now)
@@ -1126,12 +1244,13 @@ You can turn this off at any time in Settings → Cloud bridge.
             now: now,
             lastProactiveUtteranceAt: nil,
             lastEpisodicRecallAt: nil,
-            lastUserInputAt: nil,
+            lastUserInputAt: userInputActivityMonitor.lastUserInputAt,
             frontmostAppBundleIdentifier: frontmostBundleIdentifier,
-            isOnActiveCall: false,
+            isOnActiveCall: activeCallDetector.isOnActiveCall,
             wakeWordConfidence: nil,
             intent: .pureKnowledge,
-            proactiveSource: .morningTriage
+            proactiveSource: .morningTriage,
+            profile: proactivityProfile
         )
     }
 
@@ -1529,15 +1648,16 @@ You can turn this off at any time in Settings → Cloud bridge.
             now: now,
             lastProactiveUtteranceAt: nil,
             lastEpisodicRecallAt: nil,
-            lastUserInputAt: nil,
+            lastUserInputAt: userInputActivityMonitor.lastUserInputAt,
             frontmostAppBundleIdentifier: frontmostBundleIdentifier,
-            isOnActiveCall: false,
+            isOnActiveCall: activeCallDetector.isOnActiveCall,
             wakeWordConfidence: nil,
             // Failures are always meaningful intent for the gate's
             // confidence check; the active-call gate is the real
             // filter we care about here.
             intent: .pureKnowledge,
-            proactiveSource: .watchNudge
+            proactiveSource: .watchNudge,
+            profile: proactivityProfile
         )
     }
 
@@ -2565,6 +2685,21 @@ You can turn this off at any time in Settings → Cloud bridge.
         if isMorningTriageEnabled {
             morningTriageScheduler.start()
         }
+
+        // Wave 1a restraint policy: keep the input-activity monitor
+        // and the active-call detector running so proactive nudges
+        // see live "user is busy" signals. The input-activity monitor
+        // is Accessibility-gated and will no-op until that permission
+        // is granted; the permission poller calls `start()` again on
+        // first grant so we re-attempt seamlessly.
+        userInputActivityMonitor.start()
+        activeCallDetector.start()
+
+        // Background drain for utterances the gate parked while the
+        // user was busy. Tick every 10s — long enough that we don't
+        // churn TTS, short enough that a paused-for-30-seconds break
+        // doesn't feel stale.
+        startProactiveQueueDrainTimer()
     }
 
     /// 5-minute idle sweep that drops thread-memory state when the
@@ -2618,6 +2753,11 @@ You can turn this off at any time in Settings → Cloud bridge.
         threadMemoryIdleSweepTimer?.invalidate()
         threadMemoryIdleSweepTimer = nil
         morningTriageScheduler.stop()
+
+        userInputActivityMonitor.stop()
+        activeCallDetector.stop()
+        proactiveQueueDrainTimer?.invalidate()
+        proactiveQueueDrainTimer = nil
     }
 
     func refreshAllPermissions() {

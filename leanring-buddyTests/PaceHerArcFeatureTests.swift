@@ -24,13 +24,14 @@ final class PaceRestraintGateTests: XCTestCase {
             isOnActiveCall: true,
             wakeWordConfidence: 0.1,
             intent: .unknown,
-            proactiveSource: .userPushToTalk
+            proactiveSource: .userPushToTalk,
+            profile: .balanced
         )
 
         XCTAssertEqual(PaceRestraintGate.decide(context), .speak)
     }
 
-    func testActiveCallSilencesProactiveSpeech() {
+    func testActiveCallQueuesProactiveSpeechUntilIdle() {
         let context = PaceRestraintContext(
             now: Date(),
             lastProactiveUtteranceAt: nil,
@@ -40,10 +41,11 @@ final class PaceRestraintGateTests: XCTestCase {
             isOnActiveCall: false,
             wakeWordConfidence: 0.9,
             intent: .pureKnowledge,
-            proactiveSource: .wakeWord
+            proactiveSource: .wakeWord,
+            profile: .balanced
         )
 
-        XCTAssertEqual(PaceRestraintGate.decide(context), .stayQuiet(reason: "active call"))
+        XCTAssertEqual(PaceRestraintGate.decide(context), .queueUntilIdle(reason: "active call"))
     }
 
     func testWeakWakeWordDoesNotReprompt() {
@@ -56,7 +58,8 @@ final class PaceRestraintGateTests: XCTestCase {
             isOnActiveCall: false,
             wakeWordConfidence: 0.5,
             intent: .pureKnowledge,
-            proactiveSource: .wakeWord
+            proactiveSource: .wakeWord,
+            profile: .balanced
         )
 
         XCTAssertEqual(PaceRestraintGate.decide(context), .stayQuiet(reason: "wake word confidence below threshold"))
@@ -73,10 +76,232 @@ final class PaceRestraintGateTests: XCTestCase {
             isOnActiveCall: false,
             wakeWordConfidence: nil,
             intent: .screenDescription,
-            proactiveSource: .watchNudge
+            proactiveSource: .watchNudge,
+            profile: .balanced
         )
 
         XCTAssertEqual(PaceRestraintGate.decide(context), .queueUntilIdle(reason: "recent user input"))
+    }
+
+    // MARK: - Profile-tuned cooldowns
+    //
+    // Each test below sets the previous proactive utterance 11 minutes
+    // in the past so the .balanced profile (10-minute cooldown) is
+    // just past its threshold, the .talkative profile (5-minute
+    // cooldown) is well past, and the .reserved profile (30-minute
+    // cooldown) is still inside the cooldown window.
+
+    func testTalkativeProfileSpeaksJustAfterFiveMinutes() {
+        let now = Date()
+        let context = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: now.addingTimeInterval(-11 * 60),
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .talkative
+        )
+
+        XCTAssertEqual(PaceRestraintGate.decide(context), .speak)
+    }
+
+    func testBalancedProfileSpeaksJustAfterTenMinutes() {
+        let now = Date()
+        let context = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: now.addingTimeInterval(-11 * 60),
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .balanced
+        )
+
+        XCTAssertEqual(PaceRestraintGate.decide(context), .speak)
+    }
+
+    func testReservedProfileStaysQuietBeforeThirtyMinutes() {
+        let now = Date()
+        let context = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: now.addingTimeInterval(-11 * 60),
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .reserved
+        )
+
+        XCTAssertEqual(PaceRestraintGate.decide(context), .stayQuiet(reason: "proactive cooldown"))
+    }
+
+    /// The PRD-rename equivalent of `testReservedProfileStaysQuiet
+    /// BeforeThirtyMinutes` — pins the explicit 30-minute floor under
+    /// `.reserved` so a future refactor of the cooldown table can't
+    /// silently move it.
+    func testRestraintGateUnderReservedProfileEnforces30MinProactiveCooldown() {
+        let now = Date()
+        let justInsideThirtyMinuteWindow = now.addingTimeInterval(-29 * 60)
+        let justPastThirtyMinuteWindow = now.addingTimeInterval(-31 * 60)
+
+        let stillInsideCooldown = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: justInsideThirtyMinuteWindow,
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .reserved
+        )
+
+        XCTAssertEqual(
+            PaceRestraintGate.decide(stillInsideCooldown),
+            .stayQuiet(reason: "proactive cooldown")
+        )
+
+        let pastCooldown = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: justPastThirtyMinuteWindow,
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: nil,
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .reserved
+        )
+
+        XCTAssertEqual(PaceRestraintGate.decide(pastCooldown), .speak)
+    }
+
+    /// Recent user input under .talkative / .balanced should return
+    /// .queueUntilIdle so the nudge fires once the user pauses;
+    /// under .reserved the same context should fall back to the
+    /// pre-profile "stay quiet, drop the nudge" behavior.
+    func testRestraintGateReturnsQueueUntilIdleWhenInputRecentAndProfileNotReserved() {
+        let now = Date()
+
+        for profileUnderTest in [PaceProactivityProfile.talkative, .balanced] {
+            let context = PaceRestraintContext(
+                now: now,
+                lastProactiveUtteranceAt: nil,
+                lastEpisodicRecallAt: nil,
+                lastUserInputAt: now.addingTimeInterval(-1),
+                frontmostAppBundleIdentifier: nil,
+                isOnActiveCall: false,
+                wakeWordConfidence: nil,
+                intent: .screenDescription,
+                proactiveSource: .watchNudge,
+                profile: profileUnderTest
+            )
+
+            XCTAssertEqual(
+                PaceRestraintGate.decide(context),
+                .queueUntilIdle(reason: "recent user input"),
+                "Profile \(profileUnderTest) should queue, not stay quiet, on recent input"
+            )
+        }
+
+        let reservedContext = PaceRestraintContext(
+            now: now,
+            lastProactiveUtteranceAt: nil,
+            lastEpisodicRecallAt: nil,
+            lastUserInputAt: now.addingTimeInterval(-1),
+            frontmostAppBundleIdentifier: nil,
+            isOnActiveCall: false,
+            wakeWordConfidence: nil,
+            intent: .screenDescription,
+            proactiveSource: .watchNudge,
+            profile: .reserved
+        )
+
+        XCTAssertEqual(
+            PaceRestraintGate.decide(reservedContext),
+            .stayQuiet(reason: "recent user input")
+        )
+    }
+}
+
+@MainActor
+final class PaceProactiveQueueDrainTests: XCTestCase {
+    func testProactiveQueueDrainsOldestFirstWhenIdleConditionsRestore() async {
+        // Build a real CompanionManager so the queue / drain interplay
+        // is exercised end-to-end rather than against a hand-rolled
+        // double. We don't `start()` it — only the queue API matters
+        // here, and start() would spin up CGEvent taps + screen capture
+        // which an XCTest shouldn't touch.
+        let companionManager = CompanionManager()
+
+        let firstUtterance = PaceProactiveUtterance(
+            spokenText: "first queued nudge",
+            source: .watchNudge,
+            confidence: 0.8,
+            relevanceWindowExpiresAt: nil
+        )
+        let secondUtterance = PaceProactiveUtterance(
+            spokenText: "second queued nudge",
+            source: .watchNudge,
+            confidence: 0.8,
+            relevanceWindowExpiresAt: nil
+        )
+        let thirdUtterance = PaceProactiveUtterance(
+            spokenText: "third queued nudge",
+            source: .watchNudge,
+            confidence: 0.8,
+            relevanceWindowExpiresAt: nil
+        )
+
+        companionManager.enqueueProactiveUtterance(firstUtterance)
+        companionManager.enqueueProactiveUtterance(secondUtterance)
+        companionManager.enqueueProactiveUtterance(thirdUtterance)
+
+        XCTAssertEqual(
+            companionManager.proactiveUtteranceQueueSnapshot().map { $0.spokenText },
+            ["first queued nudge", "second queued nudge", "third queued nudge"]
+        )
+
+        // Capacity cap: a fourth utterance evicts the oldest.
+        let fourthUtterance = PaceProactiveUtterance(
+            spokenText: "fourth queued nudge",
+            source: .watchNudge,
+            confidence: 0.8,
+            relevanceWindowExpiresAt: nil
+        )
+        companionManager.enqueueProactiveUtterance(fourthUtterance)
+
+        XCTAssertEqual(
+            companionManager.proactiveUtteranceQueueSnapshot().map { $0.spokenText },
+            ["second queued nudge", "third queued nudge", "fourth queued nudge"],
+            "Oldest entry should be evicted on overflow"
+        )
+
+        // Simulate "idle restored": no recent input, not on a call,
+        // voice state is .idle (CompanionManager default). A single
+        // drain pass should consume exactly the oldest entry.
+        companionManager.drainProactiveQueueIfIdle(now: Date())
+
+        // The drain task speaks via TTS asynchronously; the queue
+        // mutation is synchronous and happens before the speak Task
+        // is dispatched, so the snapshot reflects removal immediately.
+        XCTAssertEqual(
+            companionManager.proactiveUtteranceQueueSnapshot().map { $0.spokenText },
+            ["third queued nudge", "fourth queued nudge"],
+            "Drain should remove only the oldest entry per pass"
+        )
     }
 }
 
