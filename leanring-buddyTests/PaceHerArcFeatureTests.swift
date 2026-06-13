@@ -631,17 +631,27 @@ final class PaceFlowReplayTests: XCTestCase {
         XCTAssertEqual(PaceFlowCommandParser.parse("delete the flow morning standup"), .delete(name: "morning standup"))
     }
 
-    func testFlowRecorderProducesFlowAndReplayPlannerPausesBeforeSend() {
-        var recorder = PaceFlowRecorder()
-        recorder.startRecording(name: "mail draft")
-        recorder.record(.activateApp(bundleIdentifier: "com.apple.mail"))
-        recorder.record(.axPress(rolePath: ["window", "button"], label: "Send"))
+    @MainActor
+    func testFlowRecorderProducesFlowAndReplayPlannerPausesBeforeSend() async throws {
+        // Wave 3a renamed `PaceFlowRecorder` from a passive struct into
+        // a @MainActor class backed by a real CGEventTap. The replay
+        // planner is unaffected — we use a hand-built `PaceRecordedFlow`
+        // here so this test still pins the "pause before send"
+        // heuristic without needing to drive the live tap.
+        let flow = PaceRecordedFlow(
+            name: "mail draft",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            steps: [
+                .activateApp(bundleIdentifier: "com.apple.mail"),
+                .axPress(rolePath: ["window", "button"], label: "Send"),
+            ]
+        )
 
-        let flow = recorder.stopRecording(now: Date(timeIntervalSince1970: 1_700_000_000))
-
-        XCTAssertEqual(flow?.name, "mail draft")
-        XCTAssertEqual(flow?.steps.count, 2)
-        XCTAssertEqual(PaceFlowReplayPlanner.replayObservations(for: try XCTUnwrap(flow)).last, "ready to send - say go ahead")
+        XCTAssertEqual(flow.steps.count, 2)
+        XCTAssertEqual(
+            PaceFlowReplayPlanner.replayObservations(for: flow).last,
+            "ready to send - say go ahead"
+        )
     }
 
     func testFlowToolsParseThroughActionLayer() {
